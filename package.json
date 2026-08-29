@@ -1,0 +1,15 @@
+{
+  "name": "linkedin-poster",
+  "version": "1.0.0",
+  "description": "A small self-hosted service: draft a LinkedIn post, review/edit it, and approve it to publish to your personal LinkedIn profile.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "node-fetch": "^2.7.0",
+    "dotenv": "^16.4.5"
+  }
+}
