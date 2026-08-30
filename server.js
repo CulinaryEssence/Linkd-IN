@@ -25,10 +25,12 @@ const express = require('express');
 const fetch = require('node-fetch');
 const { createClient } = require('redis');
 const crypto = require('crypto');
+const cookieParser = require('cookie-parser');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
 
 // Allow the Ops Hub app (a different origin) to call this service directly —
 // e.g. sending a drafted post here to join the approval queue.
@@ -87,17 +89,74 @@ async function saveDrafts(drafts) {
   await r.set('li:drafts', JSON.stringify(drafts));
 }
 
-// ---------- basic auth for the dashboard ----------
+// ---------- session auth for the dashboard ----------
+// A long-lived, stateless signed cookie — no repeated browser login
+// prompts. Computed from DASHBOARD_PASSWORD, so it needs no separate
+// storage and stays valid across restarts as long as the password
+// env var doesn't change.
+const SESSION_COOKIE = 'ce_session';
+function computeSessionToken() {
+  return crypto.createHmac('sha256', DASHBOARD_PASSWORD).update('linkedin-poster-session').digest('hex');
+}
+
 function requireDashboardAuth(req, res, next) {
+  // 1. Valid session cookie (browser, after logging in via /login) — no repeat prompts.
+  if (req.cookies && req.cookies[SESSION_COOKIE] === computeSessionToken()) return next();
+
+  // 2. Valid Basic Auth header (used by the Ops Hub app calling the API cross-origin,
+  //    where cookies can't be shared across origins/local files).
   const header = req.headers.authorization || '';
   const [scheme, encoded] = header.split(' ');
   if (scheme === 'Basic' && encoded) {
     const [, pass] = Buffer.from(encoded, 'base64').toString().split(':');
     if (pass === DASHBOARD_PASSWORD) return next();
   }
-  res.set('WWW-Authenticate', 'Basic realm="LinkedIn Poster"');
-  return res.status(401).send('Authentication required.');
+
+  // 3. Browser navigating to a page (not a script/API call) — send to a real login
+  //    page instead of triggering the native, poorly-remembered Basic Auth popup.
+  if (req.headers.accept && req.headers.accept.includes('text/html')) {
+    return res.redirect('/login');
+  }
+
+  res.status(401).json({ error: 'Authentication required.' });
 }
+
+// ---------- login page (sets the long-lived cookie) ----------
+app.get('/login', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head><title>Sign in — LinkedIn Poster</title>
+    <style>
+      body{font-family:sans-serif;max-width:360px;margin:80px auto;padding:0 16px;}
+      input{width:100%;padding:10px;margin:10px 0;box-sizing:border-box;font-size:15px;}
+      button{width:100%;padding:10px;background:#1a7f37;color:white;border:none;border-radius:6px;font-size:15px;cursor:pointer;}
+      .error{color:#c53030;font-size:13px;}
+    </style>
+    </head>
+    <body>
+      <h2>LinkedIn Poster</h2>
+      <form method="POST" action="/login">
+        <input type="password" name="password" placeholder="Dashboard password" autofocus required>
+        <button type="submit">Sign in</button>
+      </form>
+      ${req.query.error ? '<p class="error">Wrong password — try again.</p>' : ''}
+    </body>
+    </html>
+  `);
+});
+
+app.post('/login', (req, res) => {
+  if (req.body.password === DASHBOARD_PASSWORD) {
+    res.cookie(SESSION_COOKIE, computeSessionToken(), {
+      httpOnly: true,
+      maxAge: 90 * 24 * 60 * 60 * 1000, // 90 days — no repeated logins
+      sameSite: 'lax'
+    });
+    return res.redirect('/');
+  }
+  res.redirect('/login?error=1');
+});
 
 // ---------- OAuth: step 1, send the user to LinkedIn ----------
 app.get('/auth/linkedin', (req, res) => {
@@ -377,15 +436,12 @@ app.get('/', requireDashboardAuth, async (req, res) => {
       ${postedHtml}
 
       <script>
-        function authHeader(){
-          const pass = sessionStorage.getItem('dashPass') || prompt('Dashboard password:');
-          sessionStorage.setItem('dashPass', pass);
-          return 'Basic ' + btoa(':' + pass);
-        }
+        // The session cookie (set once at /login) authenticates these
+        // requests automatically — no more password prompts here.
         async function changeSlot(id, slot){
           await fetch('/api/drafts/'+id, {
             method:'PATCH',
-            headers:{'Content-Type':'application/json','Authorization':authHeader()},
+            headers:{'Content-Type':'application/json'},
             body: JSON.stringify({slot})
           });
           location.reload();
@@ -397,7 +453,7 @@ app.get('/', requireDashboardAuth, async (req, res) => {
           const slot = document.getElementById('newSlot').value;
           await fetch('/api/drafts', {
             method:'POST',
-            headers:{'Content-Type':'application/json','Authorization':authHeader()},
+            headers:{'Content-Type':'application/json'},
             body: JSON.stringify({text, imageUrl, slot})
           });
           location.reload();
@@ -406,21 +462,21 @@ app.get('/', requireDashboardAuth, async (req, res) => {
           const text = document.querySelector('textarea[data-id="'+id+'"]').value;
           await fetch('/api/drafts/'+id, {
             method:'PATCH',
-            headers:{'Content-Type':'application/json','Authorization':authHeader()},
+            headers:{'Content-Type':'application/json'},
             body: JSON.stringify({text})
           });
           alert('Saved.');
         }
         async function postDraft(id){
           if(!confirm('Post this to LinkedIn now?')) return;
-          const res = await fetch('/api/drafts/'+id+'/post', {method:'POST', headers:{'Authorization':authHeader()}});
+          const res = await fetch('/api/drafts/'+id+'/post', {method:'POST'});
           const data = await res.json();
           if(data.error){ alert('Failed: ' + JSON.stringify(data)); return; }
           location.reload();
         }
         async function deleteDraft(id){
           if(!confirm('Delete this draft?')) return;
-          await fetch('/api/drafts/'+id, {method:'DELETE', headers:{'Authorization':authHeader()}});
+          await fetch('/api/drafts/'+id, {method:'DELETE'});
           location.reload();
         }
       </script>
