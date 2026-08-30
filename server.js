@@ -677,7 +677,10 @@ app.get('/', requireDashboardAuth, async (req, res) => {
         ` : ''}
       </div>
       <textarea data-id="${d.id}" ${d.status === 'posted' ? 'readonly' : ''}>${escapeHtml(d.text)}</textarea>
-      ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:200px;display:block;margin:8px 0;">` : ''}
+      ${d.status !== 'posted' ? `
+        <input type="text" data-image-id="${d.id}" value="${(d.imageUrl||'').replace(/"/g,'&quot;')}" placeholder="Image URL (paste before approving)" style="width:100%;padding:8px;margin-top:8px;box-sizing:border-box;font-size:13px;">
+      ` : ''}
+      ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:200px;display:block;margin:8px 0;">` : (d.status !== 'posted' ? '<p style="font-size:12px;color:#c53030;margin:6px 0;">No image attached yet.</p>' : '')}
       <div class="meta">
         ${d.scheduledDate ? '📅 Scheduled for ' + d.scheduledDate + '<br>' : ''}
         ${d.status === 'posted'
@@ -875,15 +878,25 @@ app.get('/', requireDashboardAuth, async (req, res) => {
         }
         async function saveDraft(id){
           const text = document.querySelector('textarea[data-id="'+id+'"]').value;
+          const imageInput = document.querySelector('input[data-image-id="'+id+'"]');
+          const imageUrl = imageInput ? imageInput.value : undefined;
           await fetch('/api/drafts/'+id, {
             method:'PATCH',
             headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({text})
+            body: JSON.stringify({text, imageUrl})
           });
-          alert('Saved.');
+          location.reload();
         }
         async function postDraft(id){
-          if(!confirm('Post this to LinkedIn now?')) return;
+          const imageInput = document.querySelector('input[data-image-id="'+id+'"]');
+          const hasImage = imageInput && imageInput.value.trim().length > 0;
+          const msg = hasImage ? 'Post this to LinkedIn now?' : 'No image attached — post anyway without one?';
+          if(!confirm(msg)) return;
+          await fetch('/api/drafts/'+id, {
+            method:'PATCH',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({imageUrl: imageInput ? imageInput.value : undefined})
+          });
           const res = await fetch('/api/drafts/'+id+'/post', {method:'POST'});
           const data = await res.json();
           if(data.error){ alert('Failed: ' + JSON.stringify(data)); return; }
