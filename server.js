@@ -327,7 +327,7 @@ app.get('/api/drafts', requireDashboardAuth, async (req, res) => {
 
 // ---------- add a draft (call this from anywhere, e.g. paste one in from Claude) ----------
 app.post('/api/drafts', requireDashboardAuth, async (req, res) => {
-  const { text, imageUrl, slot } = req.body;
+  const { text, imageUrl, slot, scheduledDate } = req.body;
   if (!text) return res.status(400).json({ error: 'text is required' });
   const drafts = await getDrafts();
   const draft = {
@@ -335,12 +335,52 @@ app.post('/api/drafts', requireDashboardAuth, async (req, res) => {
     text,
     imageUrl: imageUrl || null,
     slot: slot || 'Anytime', // Morning | Midday | Evening | Anytime
+    scheduledDate: scheduledDate || null, // YYYY-MM-DD — which day this is meant for
     status: 'pending', // pending | posted
     createdAt: new Date().toISOString()
   };
   drafts.unshift(draft);
   await saveDrafts(drafts);
   res.json(draft);
+});
+
+// ---------- bulk import: paste many posts, each gets the next available day ----------
+// Posts are separated by a line containing only "---". Each one is scheduled
+// for the day after the last already-scheduled draft (or today, if none are
+// scheduled yet) — so importing 100 posts fills the next 100 days without
+// clashing with anything already queued.
+app.post('/api/drafts/bulk-import', requireDashboardAuth, async (req, res) => {
+  const { textBlock } = req.body;
+  if (!textBlock || !textBlock.trim()) return res.status(400).json({ error: 'textBlock is required' });
+
+  const posts = textBlock.split(/\n\s*---\s*\n/).map(p => p.trim()).filter(p => p.length > 0);
+  if (posts.length === 0) return res.status(400).json({ error: 'No posts found — separate each one with a line containing only ---' });
+
+  const drafts = await getDrafts();
+  const existingDates = drafts.filter(d => d.scheduledDate).map(d => d.scheduledDate);
+  let startDate = new Date();
+  if (existingDates.length > 0) {
+    const latest = existingDates.sort().slice(-1)[0];
+    startDate = new Date(latest + 'T00:00:00Z');
+    startDate.setUTCDate(startDate.getUTCDate() + 1);
+  }
+
+  const newDrafts = posts.map((text, i) => {
+    const d = new Date(startDate);
+    d.setUTCDate(d.getUTCDate() + i);
+    return {
+      id: crypto.randomUUID(),
+      text,
+      imageUrl: null,
+      slot: 'Anytime',
+      scheduledDate: d.toISOString().slice(0, 10),
+      status: 'pending',
+      createdAt: new Date().toISOString()
+    };
+  });
+
+  await saveDrafts([...drafts, ...newDrafts]);
+  res.json({ ok: true, imported: newDrafts.length, firstDate: newDrafts[0].scheduledDate, lastDate: newDrafts[newDrafts.length - 1].scheduledDate });
 });
 
 // ---------- edit a draft before approving ----------
@@ -639,6 +679,7 @@ app.get('/', requireDashboardAuth, async (req, res) => {
       <textarea data-id="${d.id}" ${d.status === 'posted' ? 'readonly' : ''}>${escapeHtml(d.text)}</textarea>
       ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:200px;display:block;margin:8px 0;">` : ''}
       <div class="meta">
+        ${d.scheduledDate ? '📅 Scheduled for ' + d.scheduledDate + '<br>' : ''}
         ${d.status === 'posted'
           ? '✓ Posted to LinkedIn ' + d.postedAt + (d.linkedinPostUrl ? ' — <a href="' + d.linkedinPostUrl + '" target="_blank">view post</a>' : ' <span style="color:#c53030;">(no post link captured — verify manually)</span>')
           : 'Pending review'}
@@ -664,11 +705,33 @@ app.get('/', requireDashboardAuth, async (req, res) => {
   const pending = drafts.filter(d => d.status !== 'posted');
   const posted = drafts.filter(d => d.status === 'posted');
 
+  const scheduled = pending.filter(d => d.scheduledDate).sort((a, b) => a.scheduledDate.localeCompare(b.scheduledDate));
+  const unscheduled = pending.filter(d => !d.scheduledDate);
+
+  const todaysDraft = scheduled.find(d => d.scheduledDate === todayUTC);
+  const overdueDrafts = scheduled.filter(d => d.scheduledDate < todayUTC);
+  const upcomingDrafts = scheduled.filter(d => d.scheduledDate > todayUTC);
+
+  const todaySection = todaysDraft
+    ? `<div style="border:2px solid #1a7f37;border-radius:10px;padding:4px;margin-bottom:24px;"><h3 style="margin:10px 0 10px 10px;">📌 Today's post (${todayUTC})</h3>${draftCard(todaysDraft)}</div>`
+    : `<div class="status" style="background:#f0f0f0;color:#555;">No post scheduled for today (${todayUTC}).</div>`;
+
+  const overdueSection = overdueDrafts.length
+    ? `<h4 style="margin-top:20px;color:#c53030;">⚠ Overdue (${overdueDrafts.length}) — missed days, still pending</h4>${overdueDrafts.map(draftCard).join('')}`
+    : '';
+
+  const upcomingPreview = upcomingDrafts.slice(0, 5);
+  const upcomingRemainingCount = upcomingDrafts.length - upcomingPreview.length;
+  const upcomingSection = upcomingDrafts.length
+    ? `<h4 style="margin-top:20px;">Next up</h4>${upcomingPreview.map(d => `<div class="card" style="padding:10px 14px;"><strong>${d.scheduledDate}</strong> — ${escapeHtml(d.text.slice(0,80))}${d.text.length>80?'...':''}</div>`).join('')}
+       ${upcomingRemainingCount > 0 ? `<p style="font-size:13px;color:#666;">...and ${upcomingRemainingCount} more scheduled through ${upcomingDrafts[upcomingDrafts.length-1].scheduledDate}.</p>` : ''}`
+    : '';
+
   const pendingBySlot = SLOTS.map(slot => {
-    const items = pending.filter(d => (d.slot || 'Anytime') === slot);
+    const items = unscheduled.filter(d => (d.slot || 'Anytime') === slot);
     if (items.length === 0) return '';
     return `<h4 style="margin-top:20px;">${slot}</h4>${items.map(draftCard).join('')}`;
-  }).join('') || '<p>No pending drafts.</p>';
+  }).join('');
 
   const postedHtml = posted.length ? `<h3 style="margin-top:30px;">Posted</h3>${posted.map(draftCard).join('')}` : '';
 
@@ -746,8 +809,21 @@ app.get('/', requireDashboardAuth, async (req, res) => {
       </div>
       ${alreadyPostedToday ? `<div class="status" style="background:#fff4e5;color:#7a4a00;">One post per day — you've already posted today (${todayUTC}). Next post unlocks tomorrow.</div>` : ''}
 
+      ${todaySection}
+      ${overdueSection}
+      ${upcomingSection}
+
+      <details style="margin:24px 0;">
+        <summary style="cursor:pointer;font-weight:bold;">Bulk import a series (e.g. 100 posts, one per day)</summary>
+        <form class="new-draft" onsubmit="return bulkImport(event)" style="margin-top:12px;">
+          <p style="font-size:13px;color:#666;">Paste all your posts below, separating each one with a line containing only <code>---</code>. The first one gets scheduled for the next open day, and each one after gets the following day.</p>
+          <textarea id="bulkText" placeholder="Post 1 text...&#10;&#10;---&#10;&#10;Post 2 text...&#10;&#10;---&#10;&#10;Post 3 text..." style="min-height:160px;"></textarea>
+          <button type="submit">Import series</button>
+        </form>
+      </details>
+
       <form class="new-draft" onsubmit="return addDraft(event)">
-        <h3>New draft</h3>
+        <h3>New draft (one-off, unscheduled)</h3>
         <textarea id="newText" placeholder="Paste or write the post text here..."></textarea>
         <input id="newImage" type="text" placeholder="Image URL (optional)" style="width:100%;padding:8px;margin-top:8px;box-sizing:border-box;">
         <select id="newSlot" style="width:100%;padding:8px;margin-top:8px;box-sizing:border-box;">
@@ -756,8 +832,7 @@ app.get('/', requireDashboardAuth, async (req, res) => {
         <button type="submit">Add to queue</button>
       </form>
 
-      <h3>Pending, by time slot</h3>
-      ${pendingBySlot}
+      ${pendingBySlot ? `<h3>Other pending (unscheduled)</h3>${pendingBySlot}` : ''}
       ${postedHtml}
       ${replySection}
 
@@ -782,6 +857,20 @@ app.get('/', requireDashboardAuth, async (req, res) => {
             headers:{'Content-Type':'application/json'},
             body: JSON.stringify({text, imageUrl, slot})
           });
+          location.reload();
+        }
+        async function bulkImport(e){
+          e.preventDefault();
+          const textBlock = document.getElementById('bulkText').value;
+          if(!textBlock.trim()) return;
+          const res = await fetch('/api/drafts/bulk-import', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({textBlock})
+          });
+          const data = await res.json();
+          if(data.error){ alert('Import failed: ' + data.error); return; }
+          alert('Imported ' + data.imported + ' posts, scheduled ' + data.firstDate + ' through ' + data.lastDate + '.');
           location.reload();
         }
         async function saveDraft(id){
