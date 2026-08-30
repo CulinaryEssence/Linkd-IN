@@ -138,7 +138,7 @@ async function publishToWixBlog(draft) {
 // not shared, resets on restart) if REDIS_URL isn't set, so the app
 // still runs even before that env var is configured.
 let redisClient = null;
-let memoryFallback = { token: null, drafts: [] };
+let memoryFallback = { token: null, drafts: [], replyDrafts: [] };
 
 async function getRedis() {
   if (!REDIS_URL) return null;
@@ -170,6 +170,17 @@ async function saveDrafts(drafts) {
   const r = await getRedis();
   if (!r) { memoryFallback.drafts = drafts; return; }
   await r.set('li:drafts', JSON.stringify(drafts));
+}
+async function getReplyDrafts() {
+  const r = await getRedis();
+  if (!r) return memoryFallback.replyDrafts || [];
+  const raw = await r.get('li:reply-drafts');
+  return raw ? JSON.parse(raw) : [];
+}
+async function saveReplyDrafts(replyDrafts) {
+  const r = await getRedis();
+  if (!r) { memoryFallback.replyDrafts = replyDrafts; return; }
+  await r.set('li:reply-drafts', JSON.stringify(replyDrafts));
 }
 
 // ---------- session auth for the dashboard ----------
@@ -352,6 +363,100 @@ app.delete('/api/drafts/:id', requireDashboardAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------- REPLY DRAFTS ----------
+// Comment detection stays manual — LinkedIn doesn't grant read access to
+// comments (r_member_social) to third-party apps. You see a comment on
+// LinkedIn yourself, paste it in here, get/edit a suggested reply, and
+// approving it posts the real reply via the API.
+
+// list reply drafts
+app.get('/api/reply-drafts', requireDashboardAuth, async (req, res) => {
+  res.json(await getReplyDrafts());
+});
+
+// add a reply draft (comment you saw + your target post + a suggested reply)
+app.post('/api/reply-drafts', requireDashboardAuth, async (req, res) => {
+  const { commentText, commentAuthor, targetPostUrn, suggestedReply } = req.body;
+  if (!commentText || !targetPostUrn) {
+    return res.status(400).json({ error: 'commentText and targetPostUrn are required' });
+  }
+  const replyDrafts = await getReplyDrafts();
+  const draft = {
+    id: crypto.randomUUID(),
+    commentText,
+    commentAuthor: commentAuthor || null,
+    targetPostUrn,
+    suggestedReply: suggestedReply || '',
+    status: 'pending',
+    createdAt: new Date().toISOString()
+  };
+  replyDrafts.unshift(draft);
+  await saveReplyDrafts(replyDrafts);
+  res.json(draft);
+});
+
+// edit a reply draft before approving
+app.patch('/api/reply-drafts/:id', requireDashboardAuth, async (req, res) => {
+  const replyDrafts = await getReplyDrafts();
+  const draft = replyDrafts.find(d => d.id === req.params.id);
+  if (!draft) return res.status(404).json({ error: 'not found' });
+  if (req.body.suggestedReply !== undefined) draft.suggestedReply = req.body.suggestedReply;
+  await saveReplyDrafts(replyDrafts);
+  res.json(draft);
+});
+
+// delete a reply draft
+app.delete('/api/reply-drafts/:id', requireDashboardAuth, async (req, res) => {
+  let replyDrafts = await getReplyDrafts();
+  replyDrafts = replyDrafts.filter(d => d.id !== req.params.id);
+  await saveReplyDrafts(replyDrafts);
+  res.json({ ok: true });
+});
+
+// approve & post the reply as a real LinkedIn comment
+app.post('/api/reply-drafts/:id/post', requireDashboardAuth, async (req, res) => {
+  const token = await getToken();
+  if (!token) return res.status(400).json({ error: 'LinkedIn is not connected yet. Visit /auth/linkedin first.' });
+
+  const replyDrafts = await getReplyDrafts();
+  const draft = replyDrafts.find(d => d.id === req.params.id);
+  if (!draft) return res.status(404).json({ error: 'not found' });
+  if (!draft.suggestedReply || !draft.suggestedReply.trim()) {
+    return res.status(400).json({ error: 'Write a reply before approving.' });
+  }
+
+  try {
+    const commentRes = await fetch(
+      `https://api.linkedin.com/rest/socialActions/${encodeURIComponent(draft.targetPostUrn)}/comments`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token.access_token}`,
+          'Content-Type': 'application/json',
+          'LinkedIn-Version': '202608',
+          'X-Restli-Protocol-Version': '2.0.0'
+        },
+        body: JSON.stringify({
+          actor: token.person_urn,
+          message: { text: draft.suggestedReply }
+        })
+      }
+    );
+
+    if (!commentRes.ok) {
+      const errText = await commentRes.text();
+      return res.status(502).json({ error: `LinkedIn rejected the reply (${commentRes.status})`, detail: errText });
+    }
+
+    draft.status = 'posted';
+    draft.postedAt = new Date().toISOString();
+    await saveReplyDrafts(replyDrafts);
+    res.json({ ok: true, draft });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------- register + upload an image to LinkedIn, return its URN ----------
 async function uploadImageToLinkedIn(imageUrl, accessToken, personUrn) {
   // Step 1: tell LinkedIn you want to upload an image, get an upload URL back
@@ -498,6 +603,7 @@ app.post('/api/drafts/:id/post', requireDashboardAuth, async (req, res) => {
 app.get('/', requireDashboardAuth, async (req, res) => {
   const token = await getToken();
   const drafts = await getDrafts();
+  const replyDrafts = await getReplyDrafts();
 
   const SLOTS = ['Morning', 'Midday', 'Evening', 'Anytime'];
   const slotColor = { Morning:'#fff4e5', Midday:'#e5f4ff', Evening:'#f0e5ff', Anytime:'#f0f0f0' };
@@ -547,6 +653,53 @@ app.get('/', requireDashboardAuth, async (req, res) => {
 
   const postedHtml = posted.length ? `<h3 style="margin-top:30px;">Posted</h3>${posted.map(draftCard).join('')}` : '';
 
+  const postedWithLinkedInUrn = posted.filter(d => d.linkedinPostUrn);
+  const targetOptions = postedWithLinkedInUrn.map(d =>
+    `<option value="${escapeHtml(d.linkedinPostUrn)}">${escapeHtml(d.text.slice(0, 60))}...</option>`
+  ).join('');
+
+  function replyCard(rd) {
+    const targetLabel = postedWithLinkedInUrn.find(d => d.linkedinPostUrn === rd.targetPostUrn);
+    return `
+    <div class="card ${rd.status === 'posted' ? 'posted' : ''}">
+      <div class="meta" style="margin-bottom:8px;">
+        <strong>Comment${rd.commentAuthor ? ' from ' + escapeHtml(rd.commentAuthor) : ''}:</strong><br>
+        "${escapeHtml(rd.commentText)}"
+        <br><span style="font-size:11px;">On: ${targetLabel ? escapeHtml(targetLabel.text.slice(0,50)) : rd.targetPostUrn}</span>
+      </div>
+      <textarea data-reply-id="${rd.id}" placeholder="Write or edit the reply..." ${rd.status === 'posted' ? 'readonly' : ''}>${escapeHtml(rd.suggestedReply)}</textarea>
+      <div class="meta">${rd.status === 'posted' ? '✓ Reply posted ' + rd.postedAt : 'Pending review'}</div>
+      ${rd.status !== 'posted' ? `
+        <button onclick="saveReply('${rd.id}')">Save edits</button>
+        <button onclick="postReply('${rd.id}')" class="post-btn">Approve &amp; Reply</button>
+        <button onclick="deleteReply('${rd.id}')" class="delete-btn">Delete</button>
+      ` : ''}
+    </div>
+  `;
+  }
+
+  const pendingReplies = replyDrafts.filter(d => d.status !== 'posted');
+  const postedReplies = replyDrafts.filter(d => d.status === 'posted');
+  const replyDraftsHtml = pendingReplies.map(replyCard).join('') || '<p>No pending reply drafts.</p>';
+  const postedRepliesHtml = postedReplies.length ? `<h4 style="margin-top:20px;">Posted replies</h4>${postedReplies.map(replyCard).join('')}` : '';
+
+  const replySection = `
+    <h3 style="margin-top:40px;">Reply Drafts</h3>
+    <p style="font-size:13px;color:#666;">Comment detection is manual — LinkedIn doesn't allow reading comments via API for this app. Saw a comment worth replying to? Paste it below.</p>
+    <form class="new-draft" onsubmit="return addReply(event)">
+      <h4>New reply draft</h4>
+      ${postedWithLinkedInUrn.length === 0 ? '<p style="color:#c53030;font-size:13px;">No posts with a captured LinkedIn link yet — post something first so there\'s something to reply on.</p>' : `
+        <select id="replyTarget" style="width:100%;padding:8px;margin-bottom:8px;">${targetOptions}</select>
+        <input id="commentAuthor" type="text" placeholder="Who commented (optional)" style="width:100%;padding:8px;margin-bottom:8px;box-sizing:border-box;">
+        <textarea id="commentText" placeholder="Paste the comment text here..." style="min-height:60px;"></textarea>
+        <textarea id="suggestedReply" placeholder="Your reply (write it here, or paste a suggestion)..." style="margin-top:8px;min-height:60px;"></textarea>
+        <button type="submit">Add to queue</button>
+      `}
+    </form>
+    ${replyDraftsHtml}
+    ${postedRepliesHtml}
+  `;
+
   res.send(`
     <!DOCTYPE html>
     <html>
@@ -586,6 +739,7 @@ app.get('/', requireDashboardAuth, async (req, res) => {
       <h3>Pending, by time slot</h3>
       ${pendingBySlot}
       ${postedHtml}
+      ${replySection}
 
       <script>
         // The session cookie (set once at /login) authenticates these
@@ -635,6 +789,42 @@ app.get('/', requireDashboardAuth, async (req, res) => {
           const res = await fetch('/api/drafts/'+id+'/retry-blog', {method:'POST'});
           const data = await res.json();
           if(data.error){ alert('Blog retry failed: ' + data.error); }
+          location.reload();
+        }
+        async function addReply(e){
+          e.preventDefault();
+          const targetPostUrn = document.getElementById('replyTarget').value;
+          const commentAuthor = document.getElementById('commentAuthor').value;
+          const commentText = document.getElementById('commentText').value;
+          const suggestedReply = document.getElementById('suggestedReply').value;
+          const res = await fetch('/api/reply-drafts', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({targetPostUrn, commentAuthor, commentText, suggestedReply})
+          });
+          const data = await res.json();
+          if(data.error){ alert('Failed: ' + data.error); return; }
+          location.reload();
+        }
+        async function saveReply(id){
+          const suggestedReply = document.querySelector('textarea[data-reply-id="'+id+'"]').value;
+          await fetch('/api/reply-drafts/'+id, {
+            method:'PATCH',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({suggestedReply})
+          });
+          alert('Saved.');
+        }
+        async function postReply(id){
+          if(!confirm('Post this reply to LinkedIn now?')) return;
+          const res = await fetch('/api/reply-drafts/'+id+'/post', {method:'POST'});
+          const data = await res.json();
+          if(data.error){ alert('Failed: ' + JSON.stringify(data)); return; }
+          location.reload();
+        }
+        async function deleteReply(id){
+          if(!confirm('Delete this reply draft?')) return;
+          await fetch('/api/reply-drafts/'+id, {method:'DELETE'});
           location.reload();
         }
       </script>
