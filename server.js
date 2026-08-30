@@ -103,7 +103,13 @@ async function publishToWixBlog(draft) {
   }
 
   const data = await res.json();
-  return data.draftPost ? data.draftPost.url : null;
+  if (data.draftPost && data.draftPost.url && data.draftPost.url.base) {
+    // url is { base, path } — join them into one real link
+    const base = data.draftPost.url.base.replace(/\/$/, '');
+    const path = data.draftPost.url.path || '';
+    return base + path;
+  }
+  return null;
 }
 
 // ---------- storage backed by Render's Key Value store ----------
@@ -373,6 +379,27 @@ async function uploadImageToLinkedIn(imageUrl, accessToken, personUrn) {
   return imageUrn;
 }
 
+// ---------- retry just the blog publish for an already-LinkedIn-posted draft ----------
+app.post('/api/drafts/:id/retry-blog', requireDashboardAuth, async (req, res) => {
+  const drafts = await getDrafts();
+  const draft = drafts.find(d => d.id === req.params.id);
+  if (!draft) return res.status(404).json({ error: 'not found' });
+
+  try {
+    const blogUrl = await publishToWixBlog(draft);
+    draft.blogPublished = true;
+    draft.blogUrl = blogUrl;
+    draft.blogError = null;
+    await saveDrafts(drafts);
+    res.json({ ok: true, draft });
+  } catch (blogErr) {
+    draft.blogPublished = false;
+    draft.blogError = (blogErr && blogErr.message) ? blogErr.message : String(blogErr);
+    await saveDrafts(drafts);
+    res.status(502).json({ error: draft.blogError });
+  }
+});
+
 // ---------- approve & post a draft to LinkedIn ----------
 app.post('/api/drafts/:id/post', requireDashboardAuth, async (req, res) => {
   const token = await getToken();
@@ -427,7 +454,8 @@ app.post('/api/drafts/:id/post', requireDashboardAuth, async (req, res) => {
       draft.blogUrl = blogUrl;
     } catch (blogErr) {
       draft.blogPublished = false;
-      draft.blogError = blogErr.message;
+      draft.blogError = (blogErr && blogErr.message) ? blogErr.message : String(blogErr);
+      console.error('Blog publish failed for draft', draft.id, ':', blogErr);
     }
 
     await saveDrafts(drafts);
@@ -469,6 +497,9 @@ app.get('/', requireDashboardAuth, async (req, res) => {
         <button onclick="saveDraft('${d.id}')">Save edits</button>
         <button onclick="postDraft('${d.id}')" class="post-btn">Approve &amp; Post</button>
         <button onclick="deleteDraft('${d.id}')" class="delete-btn">Delete</button>
+      ` : ''}
+      ${d.status === 'posted' && !d.blogPublished ? `
+        <button onclick="retryBlog('${d.id}')" class="post-btn">Retry blog publish</button>
       ` : ''}
     </div>
   `;
@@ -567,6 +598,12 @@ app.get('/', requireDashboardAuth, async (req, res) => {
         async function deleteDraft(id){
           if(!confirm('Delete this draft?')) return;
           await fetch('/api/drafts/'+id, {method:'DELETE'});
+          location.reload();
+        }
+        async function retryBlog(id){
+          const res = await fetch('/api/drafts/'+id+'/retry-blog', {method:'POST'});
+          const data = await res.json();
+          if(data.error){ alert('Blog retry failed: ' + data.error); }
           location.reload();
         }
       </script>
