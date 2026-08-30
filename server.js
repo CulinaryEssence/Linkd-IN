@@ -78,6 +78,21 @@ async function publishToWixBlog(draft) {
   // sensible in the title field without you having to type it separately.
   const title = (paragraphs[0] || draft.text).slice(0, 70);
 
+  // If there's an image, put it right after the title — it needs to be a
+  // real URL Wix can fetch (a static.wixstatic.com link from your Media
+  // Manager works directly; other public image URLs generally work too).
+  if (draft.imageUrl) {
+    richContentNodes.unshift({
+      type: 'IMAGE',
+      id: 'img0',
+      nodes: [],
+      imageData: {
+        image: { src: { url: draft.imageUrl } },
+        altText: title
+      }
+    });
+  }
+
   const draftPostBody = {
     draftPost: {
       title,
@@ -442,6 +457,15 @@ app.post('/api/drafts/:id/post', requireDashboardAuth, async (req, res) => {
       return res.status(502).json({ error: 'LinkedIn rejected the post', detail: errText });
     }
 
+    // LinkedIn returns the created post's URN in this header, not the body.
+    // Capture it so we have a real, clickable link to verify — not just a
+    // "success" message we're trusting blindly.
+    const postUrn = postRes.headers.get('x-restli-id') || postRes.headers.get('x-linkedin-id');
+    draft.linkedinPostUrn = postUrn || null;
+    draft.linkedinPostUrl = postUrn
+      ? `https://www.linkedin.com/feed/update/${encodeURIComponent(postUrn)}/`
+      : null;
+
     draft.status = 'posted';
     draft.postedAt = new Date().toISOString();
 
@@ -487,7 +511,9 @@ app.get('/', requireDashboardAuth, async (req, res) => {
       <textarea data-id="${d.id}" ${d.status === 'posted' ? 'readonly' : ''}>${escapeHtml(d.text)}</textarea>
       ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:200px;display:block;margin:8px 0;">` : ''}
       <div class="meta">
-        ${d.status === 'posted' ? '✓ Posted to LinkedIn ' + d.postedAt : 'Pending review'}
+        ${d.status === 'posted'
+          ? '✓ Posted to LinkedIn ' + d.postedAt + (d.linkedinPostUrl ? ' — <a href="' + d.linkedinPostUrl + '" target="_blank">view post</a>' : ' <span style="color:#c53030;">(no post link captured — verify manually)</span>')
+          : 'Pending review'}
         ${d.status === 'posted' ? (d.blogPublished
             ? '<br>✓ Blog post live' + (d.blogUrl ? ': <a href="' + d.blogUrl + '" target="_blank">' + d.blogUrl + '</a>' : '')
             : '<br>⚠ Blog publish failed: ' + (d.blogError || 'unknown error'))
