@@ -284,20 +284,34 @@ async function uploadImageToLinkedIn(imageUrl, accessToken, personUrn) {
       initializeUploadRequest: { owner: personUrn }
     })
   });
+  if (!initRes.ok) {
+    const errText = await initRes.text();
+    throw new Error(`LinkedIn rejected the image upload request (${initRes.status}): ${errText}`);
+  }
   const initData = await initRes.json();
+  if (!initData.value || !initData.value.uploadUrl) {
+    throw new Error(`LinkedIn's image upload response was missing expected fields: ${JSON.stringify(initData)}`);
+  }
   const uploadUrl = initData.value.uploadUrl;
   const imageUrn = initData.value.image;
 
   // Step 2: fetch the image bytes from wherever it currently lives...
   const imgRes = await fetch(imageUrl);
+  if (!imgRes.ok) {
+    throw new Error(`Could not fetch the image from ${imageUrl} (status ${imgRes.status}) — check the URL is public and correct.`);
+  }
   const imgBuffer = await imgRes.buffer();
 
   // ...and PUT them to the URL LinkedIn just gave you
-  await fetch(uploadUrl, {
+  const putRes = await fetch(uploadUrl, {
     method: 'PUT',
     headers: { Authorization: `Bearer ${accessToken}` },
     body: imgBuffer
   });
+  if (!putRes.ok) {
+    const errText = await putRes.text();
+    throw new Error(`Uploading the image bytes to LinkedIn failed (${putRes.status}): ${errText}`);
+  }
 
   return imageUrn;
 }
