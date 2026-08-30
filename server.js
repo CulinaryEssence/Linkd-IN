@@ -277,7 +277,7 @@ async function uploadImageToLinkedIn(imageUrl, accessToken, personUrn) {
     headers: {
       Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
-      'LinkedIn-Version': '202504',
+      'LinkedIn-Version': '202608',
       'X-Restli-Protocol-Version': '2.0.0'
     },
     body: JSON.stringify({
@@ -347,7 +347,7 @@ app.post('/api/drafts/:id/post', requireDashboardAuth, async (req, res) => {
       headers: {
         Authorization: `Bearer ${token.access_token}`,
         'Content-Type': 'application/json',
-        'LinkedIn-Version': '202504',
+        'LinkedIn-Version': '202608',
         'X-Restli-Protocol-Version': '2.0.0'
       },
       body: JSON.stringify(postBody)
