@@ -216,6 +216,46 @@ function requireDashboardAuth(req, res, next) {
 }
 
 // ---------- login page (sets the long-lived cookie) ----------
+// ---------- PWA support: installable app icon, manifest, offline shell ----------
+const ICON_192_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAIAAADdvvtQAAACOklEQVR4nO3doU0DcRyGYUqqkSR0g07QCVgIVVeBqcd0gS6ApL4Kzx7UIDtAFfceOS55Hn//fOLNz95itdvcwVD3Uw9g3gREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIllOPWCIp4fHz5f3X32y3j9//1z+aM+t/79wLC4QiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIZvnLywG+tqfR33z9eDucj6M/Oy8uEImASAREIiASAZEIiERAJAIiERCJgEgERLJY7TZTb2DGXCASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBERyBR9RFQAJnTHxAAAAAElFTkSuQmCC';
+const ICON_512_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7GkOtAAAHbUlEQVR4nO3XoU2DARRGUUqq65qQLtJFKpiBpAZPKrpDB0BjCBJZSXBoZmEGxJ8XuOdM8CVP3LzV7rS/AaDndnoAADMEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACi1tMDWNzn49vdZjs44OHl6fXrfXDAH+VwLM0HABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQtZ4ewP93OZwvh/P0imXdPx+v3x/TK+B3fAAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUatdaT+9AYABPgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgKgfwyMYUOBDLJ8AAAAASUVORK5CYII=';
+
+app.get('/manifest.json', (req, res) => {
+  res.json({
+    name: 'LinkedIn Poster',
+    short_name: 'LI Poster',
+    start_url: '/',
+    display: 'standalone',
+    background_color: '#ffffff',
+    theme_color: '#1a7f37',
+    icons: [
+      { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+      { src: '/icon-512.png', sizes: '512x512', type: 'image/png' }
+    ]
+  });
+});
+app.get('/icon-192.png', (req, res) => {
+  res.set('Content-Type', 'image/png');
+  res.send(Buffer.from(ICON_192_B64, 'base64'));
+});
+app.get('/icon-512.png', (req, res) => {
+  res.set('Content-Type', 'image/png');
+  res.send(Buffer.from(ICON_512_B64, 'base64'));
+});
+app.get('/sw.js', (req, res) => {
+  res.set('Content-Type', 'application/javascript');
+  // Minimal service worker — required for Chrome/Android's "Install app"
+  // prompt to appear. Doesn't cache aggressively since the dashboard's
+  // content (drafts, connection status) needs to always be fresh.
+  res.send(`
+    self.addEventListener('install', () => self.skipWaiting());
+    self.addEventListener('activate', () => self.clients.claim());
+    self.addEventListener('fetch', (event) => {
+      event.respondWith(fetch(event.request).catch(() => new Response('Offline')));
+    });
+  `);
+});
+
 app.get('/login', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -227,6 +267,9 @@ app.get('/login', (req, res) => {
     <meta name="apple-mobile-web-app-status-bar-style" content="black">
     <meta name="apple-mobile-web-app-title" content="LI Poster">
     <meta name="theme-color" content="#1a7f37">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="apple-touch-icon" href="/icon-192.png">
+    <link rel="icon" href="/icon-192.png">
     <title>Sign in — LinkedIn Poster</title>
     <style>
       body{font-family:sans-serif;max-width:360px;margin:80px auto;padding:0 16px;}
@@ -802,6 +845,9 @@ app.get('/', requireDashboardAuth, async (req, res) => {
       <meta name="apple-mobile-web-app-status-bar-style" content="black">
       <meta name="apple-mobile-web-app-title" content="LI Poster">
       <meta name="theme-color" content="#1a7f37">
+      <link rel="manifest" href="/manifest.json">
+      <link rel="apple-touch-icon" href="/icon-192.png">
+      <link rel="icon" href="/icon-192.png">
       <title>LinkedIn Poster</title>
       <style>
         *{box-sizing:border-box;}
@@ -969,6 +1015,9 @@ app.get('/', requireDashboardAuth, async (req, res) => {
           if(!confirm('Delete this reply draft?')) return;
           await fetch('/api/reply-drafts/'+id, {method:'DELETE'});
           location.reload();
+        }
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.register('/sw.js').catch(()=>{});
         }
       </script>
     </body>
