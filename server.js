@@ -220,11 +220,18 @@ app.get('/login', (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>
-    <head><title>Sign in — LinkedIn Poster</title>
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black">
+    <meta name="apple-mobile-web-app-title" content="LI Poster">
+    <meta name="theme-color" content="#1a7f37">
+    <title>Sign in — LinkedIn Poster</title>
     <style>
       body{font-family:sans-serif;max-width:360px;margin:80px auto;padding:0 16px;}
-      input{width:100%;padding:10px;margin:10px 0;box-sizing:border-box;font-size:15px;}
-      button{width:100%;padding:10px;background:#1a7f37;color:white;border:none;border-radius:6px;font-size:15px;cursor:pointer;}
+      input{width:100%;padding:10px;margin:10px 0;box-sizing:border-box;font-size:16px;}
+      button{width:100%;padding:12px;background:#1a7f37;color:white;border:none;border-radius:6px;font-size:16px;cursor:pointer;}
       .error{color:#c53030;font-size:13px;}
     </style>
     </head>
@@ -789,20 +796,34 @@ app.get('/', requireDashboardAuth, async (req, res) => {
     <!DOCTYPE html>
     <html>
     <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+      <meta name="apple-mobile-web-app-capable" content="yes">
+      <meta name="apple-mobile-web-app-status-bar-style" content="black">
+      <meta name="apple-mobile-web-app-title" content="LI Poster">
+      <meta name="theme-color" content="#1a7f37">
       <title>LinkedIn Poster</title>
       <style>
-        body{font-family:sans-serif;max-width:700px;margin:40px auto;padding:0 16px;}
+        *{box-sizing:border-box;}
+        body{font-family:sans-serif;max-width:700px;margin:20px auto;padding:0 16px;}
         .status{padding:10px;border-radius:6px;margin-bottom:20px;}
         .connected{background:#e6f4ea;color:#1e4620;}
         .not-connected{background:#fdeaea;color:#7a1f1f;}
         .card{border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:14px;}
         .card.posted{opacity:0.6;}
-        textarea{width:100%;min-height:100px;font-family:inherit;font-size:14px;padding:8px;box-sizing:border-box;}
-        button{margin-top:8px;margin-right:6px;padding:8px 14px;border-radius:6px;border:none;cursor:pointer;}
+        textarea{width:100%;min-height:100px;font-family:inherit;font-size:16px;padding:8px;box-sizing:border-box;}
+        input,select{font-size:16px;}
+        button{margin-top:8px;margin-right:6px;padding:10px 16px;border-radius:6px;border:none;cursor:pointer;font-size:15px;min-height:44px;}
         .post-btn{background:#1a7f37;color:white;}
         .delete-btn{background:#c53030;color:white;}
         .meta{font-size:12px;color:#666;margin-top:6px;}
         form.new-draft{border:1px dashed #aaa;border-radius:8px;padding:14px;margin-bottom:24px;}
+        @media (max-width:480px){
+          body{margin:10px auto;padding:0 12px;}
+          h1{font-size:22px;}
+          h3{font-size:17px;}
+          button{width:100%;margin-right:0;}
+        }
       </style>
     </head>
     <body>
