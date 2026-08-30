@@ -534,6 +534,18 @@ app.post('/api/drafts/:id/post', requireDashboardAuth, async (req, res) => {
   const draft = drafts.find(d => d.id === req.params.id);
   if (!draft) return res.status(404).json({ error: 'not found' });
 
+  // Once-a-day rule: block if anything has already been posted today
+  // (UTC calendar date), rather than relying on remembering not to.
+  const todayUTC = new Date().toISOString().slice(0, 10);
+  const alreadyPostedToday = drafts.some(d =>
+    d.status === 'posted' && d.postedAt && d.postedAt.slice(0, 10) === todayUTC
+  );
+  if (alreadyPostedToday) {
+    return res.status(429).json({
+      error: `You've already posted to LinkedIn today (${todayUTC}). One post per day — try again tomorrow.`
+    });
+  }
+
   try {
     let content;
     if (draft.imageUrl) {
@@ -608,6 +620,11 @@ app.get('/', requireDashboardAuth, async (req, res) => {
   const SLOTS = ['Morning', 'Midday', 'Evening', 'Anytime'];
   const slotColor = { Morning:'#fff4e5', Midday:'#e5f4ff', Evening:'#f0e5ff', Anytime:'#f0f0f0' };
 
+  // Once-a-day rule, reflected in the UI too — not just enforced server-side
+  // after you click.
+  const todayUTC = new Date().toISOString().slice(0, 10);
+  const alreadyPostedToday = drafts.some(d => d.status === 'posted' && d.postedAt && d.postedAt.slice(0, 10) === todayUTC);
+
   function draftCard(d) {
     return `
     <div class="card ${d.status === 'posted' ? 'posted' : ''}" style="border-left:5px solid ${d.status==='posted' ? '#ccc' : (slotColor[d.slot] ? '#00000022' : '#ccc')};">
@@ -632,7 +649,9 @@ app.get('/', requireDashboardAuth, async (req, res) => {
       </div>
       ${d.status !== 'posted' ? `
         <button onclick="saveDraft('${d.id}')">Save edits</button>
-        <button onclick="postDraft('${d.id}')" class="post-btn">Approve &amp; Post</button>
+        ${alreadyPostedToday
+          ? '<button disabled title="Already posted today — one post per day" style="opacity:0.5;cursor:not-allowed;">Approve &amp; Post (limit reached today)</button>'
+          : `<button onclick="postDraft('${d.id}')" class="post-btn">Approve &amp; Post</button>`}
         <button onclick="deleteDraft('${d.id}')" class="delete-btn">Delete</button>
       ` : ''}
       ${d.status === 'posted' && !d.blogPublished ? `
@@ -725,6 +744,7 @@ app.get('/', requireDashboardAuth, async (req, res) => {
       <div class="status ${token ? 'connected' : 'not-connected'}">
         ${token ? `Connected as <strong>${token.name || 'your LinkedIn account'}</strong>` : `Not connected — <a href="/auth/linkedin">connect LinkedIn</a> first.`}
       </div>
+      ${alreadyPostedToday ? `<div class="status" style="background:#fff4e5;color:#7a4a00;">One post per day — you've already posted today (${todayUTC}). Next post unlocks tomorrow.</div>` : ''}
 
       <form class="new-draft" onsubmit="return addDraft(event)">
         <h3>New draft</h3>
