@@ -48,6 +48,63 @@ const CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET;
 const REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI;
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
 const REDIS_URL = process.env.REDIS_URL;
+const WIX_API_KEY = process.env.WIX_API_KEY;
+const WIX_SITE_ID = process.env.WIX_SITE_ID;
+const WIX_MEMBER_ID = process.env.WIX_MEMBER_ID;
+
+// ---------- publish a matching post to the culinaryessence.com blog ----------
+// Uses a Wix API Key (server-to-server), separate from LinkedIn entirely.
+// A blog-publish failure never blocks or undoes the LinkedIn post — it's
+// recorded on the draft so you can see it and retry/investigate.
+async function publishToWixBlog(draft) {
+  if (!WIX_API_KEY || !WIX_SITE_ID || !WIX_MEMBER_ID) {
+    throw new Error('Wix blog isn\'t configured — set WIX_API_KEY, WIX_SITE_ID, and WIX_MEMBER_ID.');
+  }
+
+  const paragraphs = draft.text.split('\n').filter(p => p.trim().length > 0);
+  const richContentNodes = paragraphs.map((p, i) => ({
+    type: 'PARAGRAPH',
+    id: 'p' + i,
+    nodes: [{
+      type: 'TEXT',
+      id: '',
+      nodes: [],
+      textData: { text: p, decorations: [] }
+    }],
+    paragraphData: {}
+  }));
+
+  // Title: first ~70 chars of the first line, so the blog post has something
+  // sensible in the title field without you having to type it separately.
+  const title = (paragraphs[0] || draft.text).slice(0, 70);
+
+  const draftPostBody = {
+    draftPost: {
+      title,
+      memberId: WIX_MEMBER_ID,
+      richContent: { nodes: richContentNodes }
+    },
+    fieldsets: ['URL', 'RICH_CONTENT']
+  };
+
+  const res = await fetch('https://www.wixapis.com/blog/v3/draft-posts?publish=true', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': WIX_API_KEY,
+      'wix-site-id': WIX_SITE_ID
+    },
+    body: JSON.stringify(draftPostBody)
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Wix rejected the blog post (${res.status}): ${errText}`);
+  }
+
+  const data = await res.json();
+  return data.draftPost ? data.draftPost.url : null;
+}
 
 // ---------- storage backed by Render's Key Value store ----------
 // This survives the web service sleeping/restarting on the free tier —
@@ -360,6 +417,19 @@ app.post('/api/drafts/:id/post', requireDashboardAuth, async (req, res) => {
 
     draft.status = 'posted';
     draft.postedAt = new Date().toISOString();
+
+    // Blog publishing is best-effort — a failure here is recorded on the
+    // draft, but the LinkedIn post above has already succeeded and stays
+    // that way regardless of what happens next.
+    try {
+      const blogUrl = await publishToWixBlog(draft);
+      draft.blogPublished = true;
+      draft.blogUrl = blogUrl;
+    } catch (blogErr) {
+      draft.blogPublished = false;
+      draft.blogError = blogErr.message;
+    }
+
     await saveDrafts(drafts);
     res.json({ ok: true, draft });
   } catch (e) {
@@ -388,7 +458,13 @@ app.get('/', requireDashboardAuth, async (req, res) => {
       </div>
       <textarea data-id="${d.id}" ${d.status === 'posted' ? 'readonly' : ''}>${escapeHtml(d.text)}</textarea>
       ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:200px;display:block;margin:8px 0;">` : ''}
-      <div class="meta">${d.status === 'posted' ? '✓ Posted ' + d.postedAt : 'Pending review'}</div>
+      <div class="meta">
+        ${d.status === 'posted' ? '✓ Posted to LinkedIn ' + d.postedAt : 'Pending review'}
+        ${d.status === 'posted' ? (d.blogPublished
+            ? '<br>✓ Blog post live' + (d.blogUrl ? ': <a href="' + d.blogUrl + '" target="_blank">' + d.blogUrl + '</a>' : '')
+            : '<br>⚠ Blog publish failed: ' + (d.blogError || 'unknown error'))
+          : ''}
+      </div>
       ${d.status !== 'posted' ? `
         <button onclick="saveDraft('${d.id}')">Save edits</button>
         <button onclick="postDraft('${d.id}')" class="post-btn">Approve &amp; Post</button>
