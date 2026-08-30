@@ -78,16 +78,21 @@ async function publishToWixBlog(draft) {
   // sensible in the title field without you having to type it separately.
   const title = (paragraphs[0] || draft.text).slice(0, 70);
 
-  // If there's an image, put it right after the title — it needs to be a
-  // real URL Wix can fetch (a static.wixstatic.com link from your Media
-  // Manager works directly; other public image URLs generally work too).
+  // If there's an image, put it right after the title. Wix-hosted images
+  // (static.wixstatic.com — e.g. anything from your Media Manager) render
+  // properly when referenced by their internal media ID, not a plain URL —
+  // extract that ID from the URL. Other external URLs fall back to a
+  // direct URL reference, which may or may not render depending on Wix's
+  // resolver.
   if (draft.imageUrl) {
+    const wixMediaMatch = draft.imageUrl.match(/static\.wixstatic\.com\/media\/([^?#]+)/);
+    const imageSrc = wixMediaMatch ? { id: wixMediaMatch[1] } : { url: draft.imageUrl };
     richContentNodes.unshift({
       type: 'IMAGE',
       id: 'img0',
       nodes: [],
       imageData: {
-        image: { src: { url: draft.imageUrl } },
+        image: { src: imageSrc },
         altText: title
       }
     });
