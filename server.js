@@ -51,6 +51,43 @@ const REDIS_URL = process.env.REDIS_URL;
 const WIX_API_KEY = process.env.WIX_API_KEY;
 const WIX_SITE_ID = process.env.WIX_SITE_ID;
 const WIX_MEMBER_ID = process.env.WIX_MEMBER_ID;
+const CULINARY_SITE_URL = (process.env.CULINARY_SITE_URL || 'https://www.culinaryessence.com').replace(/\/$/, '');
+const LINK_TRACKING_SOURCE = process.env.LINK_TRACKING_SOURCE || 'linkedin';
+const LINK_TRACKING_MEDIUM = process.env.LINK_TRACKING_MEDIUM || 'social';
+const LINK_TRACKING_CAMPAIGN = process.env.LINK_TRACKING_CAMPAIGN || 'daily-kitchen-knowledge';
+
+function getDraftTitle(draft) {
+  const firstParagraph = (draft.text || '').split(/\n+/).find(p => p.trim().length > 0) || 'Culinary Essence';
+  return firstParagraph.replace(/^#+\s*/, '').slice(0, 70).trim();
+}
+
+function getDraftExcerpt(draft) {
+  return (draft.text || '').replace(/\s+/g, ' ').trim().slice(0, 220);
+}
+
+function isValidHttpUrl(value) {
+  try { const parsed = new URL(value); return parsed.protocol === 'http:' || parsed.protocol === 'https:'; }
+  catch { return false; }
+}
+
+function ensureCulinarySiteUrl(url) {
+  if (!isValidHttpUrl(url)) throw new Error('Wix did not return a valid published page URL.');
+  const returned = new URL(url);
+  const configured = new URL(CULINARY_SITE_URL);
+  if (returned.hostname !== configured.hostname) {
+    throw new Error('Wix returned a page outside the configured Culinary Essence website.');
+  }
+  return url;
+}
+
+function addTrackingParams(url, draft) {
+  const tracked = new URL(url);
+  tracked.searchParams.set('utm_source', LINK_TRACKING_SOURCE);
+  tracked.searchParams.set('utm_medium', LINK_TRACKING_MEDIUM);
+  tracked.searchParams.set('utm_campaign', LINK_TRACKING_CAMPAIGN);
+  tracked.searchParams.set('utm_content', String(draft.id || getDraftTitle(draft)).slice(0, 80));
+  return tracked.toString();
+}
 
 // ---------- publish a matching post to the culinaryessence.com blog ----------
 // Uses a Wix API Key (server-to-server), separate from LinkedIn entirely.
@@ -76,7 +113,7 @@ async function publishToWixBlog(draft) {
 
   // Title: first ~70 chars of the first line, so the blog post has something
   // sensible in the title field without you having to type it separately.
-  const title = (paragraphs[0] || draft.text).slice(0, 70);
+  const title = getDraftTitle(draft);
 
   // If there's an image, put it right after the title. Wix-hosted images
   // (static.wixstatic.com — e.g. anything from your Media Manager) render
@@ -127,7 +164,7 @@ async function publishToWixBlog(draft) {
     // url is { base, path } — join them into one real link
     const base = data.draftPost.url.base.replace(/\/$/, '');
     const path = data.draftPost.url.path || '';
-    return base + path;
+    return ensureCulinarySiteUrl(base + path);
   }
   return null;
 }
@@ -615,17 +652,16 @@ app.post('/api/drafts/:id/retry-blog', requireDashboardAuth, async (req, res) =>
   }
 });
 
-// ---------- approve & post a draft to LinkedIn ----------
+// ---------- approve: publish the website article first, then post its native link to LinkedIn ----------
 app.post('/api/drafts/:id/post', requireDashboardAuth, async (req, res) => {
   const token = await getToken();
   if (!token) return res.status(400).json({ error: 'LinkedIn is not connected yet. Visit /auth/linkedin first.' });
-
   const drafts = await getDrafts();
   const draft = drafts.find(d => d.id === req.params.id);
   if (!draft) return res.status(404).json({ error: 'not found' });
-
-  // Once-a-day rule: block if anything has already been posted today
-  // (UTC calendar date), rather than relying on remembering not to.
+  if (!draft.imageUrl || !isValidHttpUrl(draft.imageUrl)) {
+    return res.status(400).json({ error: 'An approved post must have a valid image URL before it can be published.' });
+  }
   const todayUTC = new Date().toISOString().slice(0, 10);
   const alreadyPostedToday = drafts.some(d =>
     d.status === 'posted' && d.postedAt && d.postedAt.slice(0, 10) === todayUTC
@@ -635,14 +671,23 @@ app.post('/api/drafts/:id/post', requireDashboardAuth, async (req, res) => {
       error: `You've already posted to LinkedIn today (${todayUTC}). One post per day — try again tomorrow.`
     });
   }
-
   try {
-    let content;
-    if (draft.imageUrl) {
-      const imageUrn = await uploadImageToLinkedIn(draft.imageUrl, token.access_token, token.person_urn);
-      content = { media: { title: '', id: imageUrn } };
+    // Create the real Culinary Essence article before touching LinkedIn.
+    // This prevents a social post from pointing to a missing page.
+    let blogUrl = draft.blogUrl;
+    if (!draft.blogPublished || !blogUrl) {
+      blogUrl = await publishToWixBlog(draft);
+      if (!blogUrl) throw new Error('Wix published the post but did not return a page URL.');
+      draft.blogPublished = true;
+      draft.blogUrl = blogUrl;
+      draft.blogError = null;
     }
+    const trackedBlogUrl = addTrackingParams(blogUrl, draft);
+    draft.trackedBlogUrl = trackedBlogUrl;
 
+    // LinkedIn article posts require a source URL. Upload the approved image
+    // as the article thumbnail so the preview is a native clickable link post.
+    const imageUrn = await uploadImageToLinkedIn(draft.imageUrl, token.access_token, token.person_urn);
     const postBody = {
       author: token.person_urn,
       commentary: draft.text,
@@ -650,9 +695,15 @@ app.post('/api/drafts/:id/post', requireDashboardAuth, async (req, res) => {
       distribution: { feedDistribution: 'MAIN_FEED', targetEntities: [], thirdPartyDistributionChannels: [] },
       lifecycleState: 'PUBLISHED',
       isReshareDisabledByAuthor: false,
-      ...(content ? { content } : {})
+      content: {
+        article: {
+          source: trackedBlogUrl,
+          title: getDraftTitle(draft),
+          description: getDraftExcerpt(draft),
+          thumbnail: imageUrn
+        }
+      }
     };
-
     const postRes = await fetch('https://api.linkedin.com/rest/posts', {
       method: 'POST',
       headers: {
@@ -663,43 +714,26 @@ app.post('/api/drafts/:id/post', requireDashboardAuth, async (req, res) => {
       },
       body: JSON.stringify(postBody)
     });
-
     if (!postRes.ok) {
       const errText = await postRes.text();
-      return res.status(502).json({ error: 'LinkedIn rejected the post', detail: errText });
+      draft.blogError = null;
+      await saveDrafts(drafts);
+      return res.status(502).json({ error: 'LinkedIn rejected the native article post; the website page remains live.', detail: errText, draft });
     }
-
-    // LinkedIn returns the created post's URN in this header, not the body.
-    // Capture it so we have a real, clickable link to verify — not just a
-    // "success" message we're trusting blindly.
     const postUrn = postRes.headers.get('x-restli-id') || postRes.headers.get('x-linkedin-id');
     draft.linkedinPostUrn = postUrn || null;
     draft.linkedinPostUrl = postUrn
       ? `https://www.linkedin.com/feed/update/${encodeURIComponent(postUrn)}/`
       : null;
-
     draft.status = 'posted';
     draft.postedAt = new Date().toISOString();
-
-    // Blog publishing is best-effort — a failure here is recorded on the
-    // draft, but the LinkedIn post above has already succeeded and stays
-    // that way regardless of what happens next.
-    try {
-      const blogUrl = await publishToWixBlog(draft);
-      draft.blogPublished = true;
-      draft.blogUrl = blogUrl;
-    } catch (blogErr) {
-      draft.blogPublished = false;
-      draft.blogError = (blogErr && blogErr.message) ? blogErr.message : String(blogErr);
-      console.error('Blog publish failed for draft', draft.id, ':', blogErr);
-    }
-
     await saveDrafts(drafts);
     res.json({ ok: true, draft });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
+
 
 // ---------- the approval dashboard itself ----------
 app.get('/', requireDashboardAuth, async (req, res) => {
