@@ -51,7 +51,11 @@ const REDIS_URL = process.env.REDIS_URL;
 const WIX_API_KEY = process.env.WIX_API_KEY;
 const WIX_SITE_ID = process.env.WIX_SITE_ID;
 const WIX_MEMBER_ID = process.env.WIX_MEMBER_ID;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+// Free image generation via our own Cloudflare Worker (Workers AI / FLUX).
+// URL and shared secret can be overridden by env vars, but default to the
+// deployed Worker so it works even before those are set on Render.
+const CF_IMAGE_WORKER_URL = process.env.CF_IMAGE_WORKER_URL || 'https://polished-snow-f047.chefsgroupce.workers.dev/';
+const CF_IMAGE_WORKER_SECRET = process.env.CF_IMAGE_WORKER_SECRET || 'wkufgaSJDHLzxbclis;hzscliashd';
 const CULINARY_SITE_URL = (process.env.CULINARY_SITE_URL || 'https://www.culinaryessence.com').replace(/\/$/, '');
 const LINK_TRACKING_SOURCE = process.env.LINK_TRACKING_SOURCE || 'linkedin';
 const LINK_TRACKING_MEDIUM = process.env.LINK_TRACKING_MEDIUM || 'social';
@@ -171,40 +175,36 @@ async function publishToWixBlog(draft) {
 }
 
 // ---------- generate a food photo for a draft, no manual image URL needed ----------
-// Two steps: (1) ask OpenAI's image model for a picture based on the draft
+// Two steps: (1) ask our Cloudflare Worker (Workers AI / FLUX) for a picture
 // text, which comes back as base64 (gpt-image-1 never returns a plain URL),
 // then (2) upload those bytes to the same Wix Media Manager already used
 // for the blog post, so the result is a real, permanently-hosted URL —
 // no external image host to babysit, and it plays nicely with the existing
 // static.wixstatic.com handling in publishToWixBlog() above.
 async function generateAIImage(draftText) {
-  if (!OPENAI_API_KEY) {
-    throw new Error('AI image generation isn\'t configured — set OPENAI_API_KEY.');
+  if (!CF_IMAGE_WORKER_URL || !CF_IMAGE_WORKER_SECRET) {
+    throw new Error('AI image generation isn\'t configured — set CF_IMAGE_WORKER_URL and CF_IMAGE_WORKER_SECRET.');
   }
   const subject = getDraftExcerpt({ text: draftText }) || 'a signature dish';
   const prompt = `Professional restaurant food photography: ${subject}. ` +
     `Appetizing, natural lighting, shallow depth of field, on an elegant plate, no text or watermarks.`;
 
-  const res = await fetch('https://api.openai.com/v1/images/generations', {
+  // Our Cloudflare Worker runs FLUX.1 schnell and returns { image: "<base64>" }.
+  const res = await fetch(CF_IMAGE_WORKER_URL, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${CF_IMAGE_WORKER_SECRET}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      model: 'gpt-image-1',
-      prompt,
-      size: '1024x1024',
-      n: 1
-    })
+    body: JSON.stringify({ prompt })
   });
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`OpenAI rejected the image request (${res.status}): ${errText}`);
+    throw new Error(`Image Worker rejected the request (${res.status}): ${errText}`);
   }
   const data = await res.json();
-  const b64 = data.data && data.data[0] && data.data[0].b64_json;
-  if (!b64) throw new Error('OpenAI response was missing the generated image.');
+  const b64 = data && data.image;
+  if (!b64) throw new Error('Image Worker response was missing the generated image.');
   return Buffer.from(b64, 'base64');
 }
 
@@ -520,7 +520,7 @@ app.post('/api/drafts', requireDashboardAuth, async (req, res) => {
   // hunt down before this can be approved. A failure here doesn't block
   // the draft — it's just left without an image, same as before, and can
   // be generated later from the dashboard's "Generate image" button.
-  if (!draft.imageUrl && OPENAI_API_KEY) {
+  if (!draft.imageUrl && CF_IMAGE_WORKER_URL) {
     try {
       draft.imageUrl = await generateAndHostImage(draft.text, draft.id);
       draft.imageSource = 'ai-generated';
@@ -574,7 +574,7 @@ app.post('/api/drafts/bulk-import', requireDashboardAuth, async (req, res) => {
   }
 
   // Note: images are NOT auto-generated here, unlike the single-draft path
-  // below. A 100-post import would mean 100 sequential OpenAI calls in one
+  // below. A 100-post import would mean 100 sequential image calls in one
   // HTTP request, which risks timing out long before it finishes. Each
   // post still gets its image generated the normal way — via the
   // "Generate image" button — when you review it ahead of its scheduled day.
