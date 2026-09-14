@@ -51,6 +51,7 @@ const REDIS_URL = process.env.REDIS_URL;
 const WIX_API_KEY = process.env.WIX_API_KEY;
 const WIX_SITE_ID = process.env.WIX_SITE_ID;
 const WIX_MEMBER_ID = process.env.WIX_MEMBER_ID;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const CULINARY_SITE_URL = (process.env.CULINARY_SITE_URL || 'https://www.culinaryessence.com').replace(/\/$/, '');
 const LINK_TRACKING_SOURCE = process.env.LINK_TRACKING_SOURCE || 'linkedin';
 const LINK_TRACKING_MEDIUM = process.env.LINK_TRACKING_MEDIUM || 'social';
@@ -167,6 +168,94 @@ async function publishToWixBlog(draft) {
     return ensureCulinarySiteUrl(base + path);
   }
   return null;
+}
+
+// ---------- generate a food photo for a draft, no manual image URL needed ----------
+// Two steps: (1) ask OpenAI's image model for a picture based on the draft
+// text, which comes back as base64 (gpt-image-1 never returns a plain URL),
+// then (2) upload those bytes to the same Wix Media Manager already used
+// for the blog post, so the result is a real, permanently-hosted URL —
+// no external image host to babysit, and it plays nicely with the existing
+// static.wixstatic.com handling in publishToWixBlog() above.
+async function generateAIImage(draftText) {
+  if (!OPENAI_API_KEY) {
+    throw new Error('AI image generation isn\'t configured — set OPENAI_API_KEY.');
+  }
+  const subject = getDraftExcerpt({ text: draftText }) || 'a signature dish';
+  const prompt = `Professional restaurant food photography: ${subject}. ` +
+    `Appetizing, natural lighting, shallow depth of field, on an elegant plate, no text or watermarks.`;
+
+  const res = await fetch('https://api.openai.com/v1/images/generations', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'gpt-image-1',
+      prompt,
+      size: '1024x1024',
+      n: 1
+    })
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`OpenAI rejected the image request (${res.status}): ${errText}`);
+  }
+  const data = await res.json();
+  const b64 = data.data && data.data[0] && data.data[0].b64_json;
+  if (!b64) throw new Error('OpenAI response was missing the generated image.');
+  return Buffer.from(b64, 'base64');
+}
+
+async function uploadImageBufferToWix(buffer, fileName) {
+  if (!WIX_API_KEY || !WIX_SITE_ID) {
+    throw new Error('Wix media isn\'t configured — set WIX_API_KEY and WIX_SITE_ID.');
+  }
+
+  // Step 1: ask Wix for a signed upload URL for this file.
+  const genRes = await fetch('https://www.wixapis.com/site-media/v1/files/generate-upload-url', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': WIX_API_KEY,
+      'wix-site-id': WIX_SITE_ID
+    },
+    body: JSON.stringify({
+      mimeType: 'image/png',
+      fileName,
+      sizeInBytes: String(buffer.length),
+      private: false
+    })
+  });
+  if (!genRes.ok) {
+    const errText = await genRes.text();
+    throw new Error(`Wix rejected the upload-URL request (${genRes.status}): ${errText}`);
+  }
+  const { uploadUrl } = await genRes.json();
+  if (!uploadUrl) throw new Error('Wix did not return an upload URL.');
+
+  // Step 2: PUT the actual image bytes to that URL.
+  const putRes = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'image/png' },
+    body: buffer
+  });
+  if (!putRes.ok) {
+    const errText = await putRes.text();
+    throw new Error(`Uploading the generated image to Wix failed (${putRes.status}): ${errText}`);
+  }
+  const putData = await putRes.json();
+  const hostedUrl = putData.file && putData.file.url;
+  if (!hostedUrl) throw new Error('Wix upload succeeded but returned no file URL.');
+  return hostedUrl;
+}
+
+// Ties the two steps together: draft text in, a hosted image URL out.
+async function generateAndHostImage(draftText, draftId) {
+  const buffer = await generateAIImage(draftText);
+  const fileName = `linkedin-post-${draftId || crypto.randomUUID()}.png`;
+  return uploadImageBufferToWix(buffer, fileName);
 }
 
 // ---------- storage backed by Render's Key Value store ----------
@@ -426,9 +515,41 @@ app.post('/api/drafts', requireDashboardAuth, async (req, res) => {
     status: 'pending', // pending | posted
     createdAt: new Date().toISOString()
   };
+
+  // No image pasted in? Generate one automatically so there's nothing to
+  // hunt down before this can be approved. A failure here doesn't block
+  // the draft — it's just left without an image, same as before, and can
+  // be generated later from the dashboard's "Generate image" button.
+  if (!draft.imageUrl && OPENAI_API_KEY) {
+    try {
+      draft.imageUrl = await generateAndHostImage(draft.text, draft.id);
+      draft.imageSource = 'ai-generated';
+    } catch (imgErr) {
+      draft.imageError = (imgErr && imgErr.message) ? imgErr.message : String(imgErr);
+    }
+  }
+
   drafts.unshift(draft);
   await saveDrafts(drafts);
   res.json(draft);
+});
+
+// ---------- generate (or regenerate) the AI image for an existing draft ----------
+app.post('/api/drafts/:id/generate-image', requireDashboardAuth, async (req, res) => {
+  const drafts = await getDrafts();
+  const draft = drafts.find(d => d.id === req.params.id);
+  if (!draft) return res.status(404).json({ error: 'not found' });
+  try {
+    draft.imageUrl = await generateAndHostImage(draft.text, draft.id);
+    draft.imageSource = 'ai-generated';
+    draft.imageError = null;
+    await saveDrafts(drafts);
+    res.json({ ok: true, draft });
+  } catch (e) {
+    draft.imageError = e.message;
+    await saveDrafts(drafts);
+    res.status(502).json({ error: e.message });
+  }
 });
 
 // ---------- bulk import: paste many posts, each gets the next available day ----------
@@ -452,6 +573,11 @@ app.post('/api/drafts/bulk-import', requireDashboardAuth, async (req, res) => {
     startDate.setUTCDate(startDate.getUTCDate() + 1);
   }
 
+  // Note: images are NOT auto-generated here, unlike the single-draft path
+  // below. A 100-post import would mean 100 sequential OpenAI calls in one
+  // HTTP request, which risks timing out long before it finishes. Each
+  // post still gets its image generated the normal way — via the
+  // "Generate image" button — when you review it ahead of its scheduled day.
   const newDrafts = posts.map((text, i) => {
     const d = new Date(startDate);
     d.setUTCDate(d.getUTCDate() + i);
@@ -762,9 +888,12 @@ app.get('/', requireDashboardAuth, async (req, res) => {
       </div>
       <textarea data-id="${d.id}" ${d.status === 'posted' ? 'readonly' : ''}>${escapeHtml(d.text)}</textarea>
       ${d.status !== 'posted' ? `
-        <input type="text" data-image-id="${d.id}" value="${(d.imageUrl||'').replace(/"/g,'&quot;')}" placeholder="Image URL (paste before approving)" style="width:100%;padding:8px;margin-top:8px;box-sizing:border-box;font-size:13px;">
+        <input type="text" data-image-id="${d.id}" value="${(d.imageUrl||'').replace(/"/g,'&quot;')}" placeholder="Image URL (auto-generated — paste one here only to override)" style="width:100%;padding:8px;margin-top:8px;box-sizing:border-box;font-size:13px;">
+        <button type="button" onclick="generateImage('${d.id}')" style="margin-top:6px;background:#444;color:white;">${d.imageUrl ? 'Regenerate image' : 'Generate image'}</button>
       ` : ''}
-      ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:200px;display:block;margin:8px 0;">` : (d.status !== 'posted' ? '<p style="font-size:12px;color:#c53030;margin:6px 0;">No image attached yet.</p>' : '')}
+      ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:200px;display:block;margin:8px 0;">` : ''}
+      ${d.imageError ? `<p style="font-size:12px;color:#c53030;margin:6px 0;">Image generation failed: ${escapeHtml(d.imageError)} — try "Generate image" again, or paste a URL above.</p>` : ''}
+      ${!d.imageUrl && !d.imageError && d.status !== 'posted' ? '<p style="font-size:12px;color:#666;margin:6px 0;">No image yet — click "Generate image" above.</p>' : ''}
       <div class="meta">
         ${d.scheduledDate ? '📅 Scheduled for ' + d.scheduledDate + '<br>' : ''}
         ${d.status === 'posted'
@@ -929,7 +1058,7 @@ app.get('/', requireDashboardAuth, async (req, res) => {
       <form class="new-draft" onsubmit="return addDraft(event)">
         <h3>New draft (one-off, unscheduled)</h3>
         <textarea id="newText" placeholder="Paste or write the post text here..."></textarea>
-        <input id="newImage" type="text" placeholder="Image URL (optional)" style="width:100%;padding:8px;margin-top:8px;box-sizing:border-box;">
+        <input id="newImage" type="text" placeholder="Image URL (leave blank — one will be generated automatically)" style="width:100%;padding:8px;margin-top:8px;box-sizing:border-box;">
         <select id="newSlot" style="width:100%;padding:8px;margin-top:8px;box-sizing:border-box;">
           ${SLOTS.map(s => `<option value="${s}">${s}</option>`).join('')}
         </select>
@@ -988,10 +1117,16 @@ app.get('/', requireDashboardAuth, async (req, res) => {
           });
           location.reload();
         }
+        async function generateImage(id){
+          const res = await fetch('/api/drafts/'+id+'/generate-image', {method:'POST'});
+          const data = await res.json();
+          if(data.error){ alert('Image generation failed: ' + data.error); return; }
+          location.reload();
+        }
         async function postDraft(id){
           const imageInput = document.querySelector('input[data-image-id="'+id+'"]');
           const hasImage = imageInput && imageInput.value.trim().length > 0;
-          const msg = hasImage ? 'Post this to LinkedIn now?' : 'No image attached — post anyway without one?';
+          const msg = hasImage ? 'Post this to LinkedIn now?' : 'No image yet — generate one first, or post anyway without one?';
           if(!confirm(msg)) return;
           await fetch('/api/drafts/'+id, {
             method:'PATCH',
