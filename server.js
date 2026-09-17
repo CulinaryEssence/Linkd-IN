@@ -1,1204 +1,162 @@
-/**
- * LinkedIn Poster — a small self-hosted approval workflow.
- *
- * What this does:
- *   1. One-time OAuth: you authorize this app to post to YOUR OWN
- *      LinkedIn profile (not a company page, not on anyone else's behalf).
- *   2. Drafts get added (either by you, or pasted in from Claude) to a
- *      simple queue.
- *   3. You open the dashboard, review/edit each draft, and click
- *      "Approve & Post" — nothing goes to LinkedIn until you do that.
- *
- * What this does NOT do:
- *   - Auto-reply to comments. LinkedIn's public API doesn't expose a
- *     reliable way to read/reply to comments for third-party apps, and
- *     automating replies risks your account's standing. Keep replies
- *     manual.
- *   - Store your token anywhere fancy. It's a local JSON file
- *     (token-store.json). Fine for a single personal-use deployment;
- *     if this ever needs to be shared with other people, swap this
- *     for a real secrets manager / database first.
- */
-
-require('dotenv').config();
+// Culinary Essence storage API.
+// Mirrors window.storage's get/set behavior exactly (same key format,
+// same {key, value} shape) so the app's existing save/load code only
+// needs its fetch target changed — not its whole data model.
 const express = require('express');
-const fetch = require('node-fetch');
-const { createClient } = require('redis');
-const crypto = require('crypto');
-const cookieParser = require('cookie-parser');
+const cors = require('cors');
+const { Pool } = require('pg');
 
 const app = express();
+app.use(cors());
 app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
-app.use(cookieParser());
 
-// Allow the Ops Hub app (a different origin) to call this service directly —
-// e.g. sending a drafted post here to join the approval queue.
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+const API_KEY = process.env.API_KEY;
+const ORG_SLUG = 'culinary-essence';
+
+// Runs on every startup. Safe to run repeatedly — every statement is
+// idempotent, so redeploying never duplicates or breaks anything.
+async function ensureSchema() {
+  await pool.query(`
+    CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+    CREATE TABLE IF NOT EXISTS organizations (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name TEXT NOT NULL,
+      slug TEXT UNIQUE NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS app_storage (
+      organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+      key TEXT NOT NULL,
+      value JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (organization_id, key)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_app_storage_org ON app_storage(organization_id);
+
+    INSERT INTO organizations (name, slug)
+    SELECT 'Culinary Essence', 'culinary-essence'
+    WHERE NOT EXISTS (SELECT 1 FROM organizations WHERE slug = 'culinary-essence');
+  `);
+  console.log('Schema check complete — tables exist and Culinary Essence organization is seeded.');
+}
+
+let orgIdCache = null;
+async function getOrgId() {
+  if (orgIdCache) return orgIdCache;
+  const { rows } = await pool.query('SELECT id FROM organizations WHERE slug = $1', [ORG_SLUG]);
+  if (!rows.length) throw new Error('Organization not found.');
+  orgIdCache = rows[0].id;
+  return orgIdCache;
+}
+
+function requireApiKey(req, res, next) {
+  if (!API_KEY) return res.status(500).json({ error: 'Server misconfigured — API_KEY not set.' });
+  const supplied = req.get('x-api-key');
+  if (supplied !== API_KEY) return res.status(401).json({ error: 'Invalid or missing API key.' });
   next();
+}
+
+app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+
+app.get('/api/storage/:key', requireApiKey, async (req, res) => {
+  try {
+    const orgId = await getOrgId();
+    const { rows } = await pool.query(
+      'SELECT key, value, updated_at FROM app_storage WHERE organization_id = $1 AND key = $2',
+      [orgId, req.params.key]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json({ key: rows[0].key, value: rows[0].value, updatedAt: rows[0].updated_at });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.put('/api/storage/:key', requireApiKey, async (req, res) => {
+  try {
+    const orgId = await getOrgId();
+    const value = req.body.value;
+    if (value === undefined) return res.status(400).json({ error: 'Missing "value" in request body.' });
+    await pool.query(
+      `INSERT INTO app_storage (organization_id, key, value, updated_at)
+       VALUES ($1, $2, $3, now())
+       ON CONFLICT (organization_id, key) DO UPDATE SET value = $3, updated_at = now()`,
+      [orgId, req.params.key, JSON.stringify(value)]
+    );
+    res.json({ key: req.params.key, value, ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/storage', requireApiKey, async (req, res) => {
+  try {
+    const orgId = await getOrgId();
+    const { rows } = await pool.query(
+      'SELECT key, updated_at, length(value::text) as size_bytes FROM app_storage WHERE organization_id = $1 ORDER BY key',
+      [orgId]
+    );
+    res.json({ keys: rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------
+// Purchase order email sending, via Resend's HTTP API. Same requireApiKey
+// gate as everything else, so the app.html frontend calls it with the
+// x-api-key it already has — no new frontend secret needed, just the new
+// RESEND_API_KEY set as a Render environment variable (never in code).
+// ---------------------------------------------------------------------
+const RESEND_FROM_ADDRESS = 'Kartik Dubey <kartik.dubey@culinaryessence.com>';
+const RESEND_API_URL = 'https://api.resend.com/emails';
+
+app.post('/api/purchasing/send-order-email', requireApiKey, async (req, res) => {
+  const { to, subject, message } = req.body || {};
+  if (!to || !subject || !message) {
+    return res.status(400).json({ error: 'Missing to, subject, or message' });
+  }
+  if (!process.env.RESEND_API_KEY) {
+    return res.status(500).json({ error: 'RESEND_API_KEY is not set on this server' });
+  }
+  try {
+    const resendRes = await fetch(RESEND_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ from: RESEND_FROM_ADDRESS, to: [to], subject, text: message })
+    });
+    const data = await resendRes.json();
+    if (!resendRes.ok) {
+      console.error('Resend API error:', data);
+      return res.status(502).json({ error: 'Resend rejected the email', details: data });
+    }
+    res.json({ success: true, id: data.id });
+  } catch (e) {
+    console.error('Failed to send order email:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
-const CLIENT_ID = process.env.LINKEDIN_CLIENT_ID;
-const CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET;
-const REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI;
-const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
-const REDIS_URL = process.env.REDIS_URL;
-const WIX_API_KEY = process.env.WIX_API_KEY;
-const WIX_SITE_ID = process.env.WIX_SITE_ID;
-const WIX_MEMBER_ID = process.env.WIX_MEMBER_ID;
-// Free image generation via our own Cloudflare Worker (Workers AI / FLUX).
-// URL and shared secret can be overridden by env vars, but default to the
-// deployed Worker so it works even before those are set on Render.
-const CF_IMAGE_WORKER_URL = process.env.CF_IMAGE_WORKER_URL || 'https://polished-snow-f047.chefsgroupce.workers.dev/';
-const CF_IMAGE_WORKER_SECRET = process.env.CF_IMAGE_WORKER_SECRET || 'wkufgaSJDHLzxbclis;hzscliashd';
-const CULINARY_SITE_URL = (process.env.CULINARY_SITE_URL || 'https://www.culinaryessence.com').replace(/\/$/, '');
-const LINK_TRACKING_SOURCE = process.env.LINK_TRACKING_SOURCE || 'linkedin';
-const LINK_TRACKING_MEDIUM = process.env.LINK_TRACKING_MEDIUM || 'social';
-const LINK_TRACKING_CAMPAIGN = process.env.LINK_TRACKING_CAMPAIGN || 'daily-kitchen-knowledge';
-
-function getDraftTitle(draft) {
-  const firstParagraph = (draft.text || '').split(/\n+/).find(p => p.trim().length > 0) || 'Culinary Essence';
-  return firstParagraph.replace(/^#+\s*/, '').slice(0, 70).trim();
-}
-
-function getDraftExcerpt(draft) {
-  return (draft.text || '').replace(/\s+/g, ' ').trim().slice(0, 220);
-}
-
-function isValidHttpUrl(value) {
-  try { const parsed = new URL(value); return parsed.protocol === 'http:' || parsed.protocol === 'https:'; }
-  catch { return false; }
-}
-
-function ensureCulinarySiteUrl(url) {
-  if (!isValidHttpUrl(url)) throw new Error('Wix did not return a valid published page URL.');
-  const returned = new URL(url);
-  const configured = new URL(CULINARY_SITE_URL);
-  if (returned.hostname !== configured.hostname) {
-    throw new Error('Wix returned a page outside the configured Culinary Essence website.');
-  }
-  return url;
-}
-
-function addTrackingParams(url, draft) {
-  const tracked = new URL(url);
-  tracked.searchParams.set('utm_source', LINK_TRACKING_SOURCE);
-  tracked.searchParams.set('utm_medium', LINK_TRACKING_MEDIUM);
-  tracked.searchParams.set('utm_campaign', LINK_TRACKING_CAMPAIGN);
-  tracked.searchParams.set('utm_content', String(draft.id || getDraftTitle(draft)).slice(0, 80));
-  return tracked.toString();
-}
-
-// ---------- publish a matching post to the culinaryessence.com blog ----------
-// Uses a Wix API Key (server-to-server), separate from LinkedIn entirely.
-// A blog-publish failure never blocks or undoes the LinkedIn post — it's
-// recorded on the draft so you can see it and retry/investigate.
-async function publishToWixBlog(draft) {
-  if (!WIX_API_KEY || !WIX_SITE_ID || !WIX_MEMBER_ID) {
-    throw new Error('Wix blog isn\'t configured — set WIX_API_KEY, WIX_SITE_ID, and WIX_MEMBER_ID.');
-  }
-
-  const paragraphs = draft.text.split('\n').filter(p => p.trim().length > 0);
-  const richContentNodes = paragraphs.map((p, i) => ({
-    type: 'PARAGRAPH',
-    id: 'p' + i,
-    nodes: [{
-      type: 'TEXT',
-      id: '',
-      nodes: [],
-      textData: { text: p, decorations: [] }
-    }],
-    paragraphData: {}
-  }));
-
-  // Title: first ~70 chars of the first line, so the blog post has something
-  // sensible in the title field without you having to type it separately.
-  const title = getDraftTitle(draft);
-
-  // If there's an image, put it right after the title. Wix-hosted images
-  // (static.wixstatic.com — e.g. anything from your Media Manager) render
-  // properly when referenced by their internal media ID, not a plain URL —
-  // extract that ID from the URL. Other external URLs fall back to a
-  // direct URL reference, which may or may not render depending on Wix's
-  // resolver.
-  if (draft.imageUrl) {
-    const wixMediaMatch = draft.imageUrl.match(/static\.wixstatic\.com\/media\/([^?#]+)/);
-    const imageSrc = wixMediaMatch ? { id: wixMediaMatch[1] } : { url: draft.imageUrl };
-    richContentNodes.unshift({
-      type: 'IMAGE',
-      id: 'img0',
-      nodes: [],
-      imageData: {
-        image: { src: imageSrc },
-        altText: title
-      }
-    });
-  }
-
-  const draftPostBody = {
-    draftPost: {
-      title,
-      memberId: WIX_MEMBER_ID,
-      richContent: { nodes: richContentNodes }
-    },
-    fieldsets: ['URL', 'RICH_CONTENT']
-  };
-
-  const res = await fetch('https://www.wixapis.com/blog/v3/draft-posts?publish=true', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': WIX_API_KEY,
-      'wix-site-id': WIX_SITE_ID
-    },
-    body: JSON.stringify(draftPostBody)
+ensureSchema()
+  .then(() => {
+    app.listen(PORT, () => console.log('Culinary Essence API listening on port ' + PORT));
+  })
+  .catch(e => {
+    console.error('Failed to set up database schema on startup:', e);
+    process.exit(1);
   });
-
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Wix rejected the blog post (${res.status}): ${errText}`);
-  }
-
-  const data = await res.json();
-  if (data.draftPost && data.draftPost.url && data.draftPost.url.base) {
-    // url is { base, path } — join them into one real link
-    const base = data.draftPost.url.base.replace(/\/$/, '');
-    const path = data.draftPost.url.path || '';
-    return ensureCulinarySiteUrl(base + path);
-  }
-  return null;
-}
-
-// ---------- generate a food photo for a draft, no manual image URL needed ----------
-// Two steps: (1) ask our Cloudflare Worker (Workers AI / FLUX) for a picture
-// text, which comes back as base64 (gpt-image-1 never returns a plain URL),
-// then (2) upload those bytes to the same Wix Media Manager already used
-// for the blog post, so the result is a real, permanently-hosted URL —
-// no external image host to babysit, and it plays nicely with the existing
-// static.wixstatic.com handling in publishToWixBlog() above.
-async function generateAIImage(draftText) {
-  if (!CF_IMAGE_WORKER_URL || !CF_IMAGE_WORKER_SECRET) {
-    throw new Error('AI image generation isn\'t configured — set CF_IMAGE_WORKER_URL and CF_IMAGE_WORKER_SECRET.');
-  }
-  const subject = getDraftExcerpt({ text: draftText }) || 'a signature dish';
-  const prompt = `Professional restaurant food photography: ${subject}. ` +
-    `Appetizing, natural lighting, shallow depth of field, on an elegant plate, no text or watermarks.`;
-
-  // Our Cloudflare Worker runs FLUX.1 schnell and returns { image: "<base64>" }.
-  const res = await fetch(CF_IMAGE_WORKER_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${CF_IMAGE_WORKER_SECRET}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ prompt })
-  });
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Image Worker rejected the request (${res.status}): ${errText}`);
-  }
-  const data = await res.json();
-  const b64 = data && data.image;
-  if (!b64) throw new Error('Image Worker response was missing the generated image.');
-  return Buffer.from(b64, 'base64');
-}
-
-async function uploadImageBufferToWix(buffer, fileName) {
-  if (!WIX_API_KEY || !WIX_SITE_ID) {
-    throw new Error('Wix media isn\'t configured — set WIX_API_KEY and WIX_SITE_ID.');
-  }
-
-  // Step 1: ask Wix for a signed upload URL for this file.
-  const genRes = await fetch('https://www.wixapis.com/site-media/v1/files/generate-upload-url', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': WIX_API_KEY,
-      'wix-site-id': WIX_SITE_ID
-    },
-    body: JSON.stringify({
-      mimeType: 'image/png',
-      fileName,
-      sizeInBytes: String(buffer.length),
-      private: false
-    })
-  });
-  if (!genRes.ok) {
-    const errText = await genRes.text();
-    throw new Error(`Wix rejected the upload-URL request (${genRes.status}): ${errText}`);
-  }
-  const { uploadUrl } = await genRes.json();
-  if (!uploadUrl) throw new Error('Wix did not return an upload URL.');
-
-  // Step 2: PUT the actual image bytes to that URL.
-  const putRes = await fetch(uploadUrl, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'image/png' },
-    body: buffer
-  });
-  if (!putRes.ok) {
-    const errText = await putRes.text();
-    throw new Error(`Uploading the generated image to Wix failed (${putRes.status}): ${errText}`);
-  }
-  const putData = await putRes.json();
-  const hostedUrl = putData.file && putData.file.url;
-  if (!hostedUrl) throw new Error('Wix upload succeeded but returned no file URL.');
-  return hostedUrl;
-}
-
-// Ties the two steps together: draft text in, a hosted image URL out.
-async function generateAndHostImage(draftText, draftId) {
-  const buffer = await generateAIImage(draftText);
-  const fileName = `linkedin-post-${draftId || crypto.randomUUID()}.png`;
-  return uploadImageBufferToWix(buffer, fileName);
-}
-
-// ---------- storage backed by Render's Key Value store ----------
-// This survives the web service sleeping/restarting on the free tier —
-// local files on disk did not. Falls back to in-memory (per-instance,
-// not shared, resets on restart) if REDIS_URL isn't set, so the app
-// still runs even before that env var is configured.
-let redisClient = null;
-let memoryFallback = { token: null, drafts: [], replyDrafts: [] };
-
-async function getRedis() {
-  if (!REDIS_URL) return null;
-  if (redisClient && redisClient.isOpen) return redisClient;
-  redisClient = createClient({ url: REDIS_URL });
-  redisClient.on('error', (err) => console.error('Redis error:', err.message));
-  await redisClient.connect();
-  return redisClient;
-}
-
-async function getToken() {
-  const r = await getRedis();
-  if (!r) return memoryFallback.token;
-  const raw = await r.get('li:token');
-  return raw ? JSON.parse(raw) : null;
-}
-async function saveToken(token) {
-  const r = await getRedis();
-  if (!r) { memoryFallback.token = token; return; }
-  await r.set('li:token', JSON.stringify(token));
-}
-async function getDrafts() {
-  const r = await getRedis();
-  if (!r) return memoryFallback.drafts;
-  const raw = await r.get('li:drafts');
-  return raw ? JSON.parse(raw) : [];
-}
-async function saveDrafts(drafts) {
-  const r = await getRedis();
-  if (!r) { memoryFallback.drafts = drafts; return; }
-  await r.set('li:drafts', JSON.stringify(drafts));
-}
-async function getReplyDrafts() {
-  const r = await getRedis();
-  if (!r) return memoryFallback.replyDrafts || [];
-  const raw = await r.get('li:reply-drafts');
-  return raw ? JSON.parse(raw) : [];
-}
-async function saveReplyDrafts(replyDrafts) {
-  const r = await getRedis();
-  if (!r) { memoryFallback.replyDrafts = replyDrafts; return; }
-  await r.set('li:reply-drafts', JSON.stringify(replyDrafts));
-}
-
-// ---------- session auth for the dashboard ----------
-// A long-lived, stateless signed cookie — no repeated browser login
-// prompts. Computed from DASHBOARD_PASSWORD, so it needs no separate
-// storage and stays valid across restarts as long as the password
-// env var doesn't change.
-const SESSION_COOKIE = 'ce_session';
-function computeSessionToken() {
-  return crypto.createHmac('sha256', DASHBOARD_PASSWORD).update('linkedin-poster-session').digest('hex');
-}
-
-function requireDashboardAuth(req, res, next) {
-  // 1. Valid session cookie (browser, after logging in via /login) — no repeat prompts.
-  if (req.cookies && req.cookies[SESSION_COOKIE] === computeSessionToken()) return next();
-
-  // 2. Valid Basic Auth header (used by the Ops Hub app calling the API cross-origin,
-  //    where cookies can't be shared across origins/local files).
-  const header = req.headers.authorization || '';
-  const [scheme, encoded] = header.split(' ');
-  if (scheme === 'Basic' && encoded) {
-    const [, pass] = Buffer.from(encoded, 'base64').toString().split(':');
-    if (pass === DASHBOARD_PASSWORD) return next();
-  }
-
-  // 3. Browser navigating to a page (not a script/API call) — send to a real login
-  //    page instead of triggering the native, poorly-remembered Basic Auth popup.
-  if (req.headers.accept && req.headers.accept.includes('text/html')) {
-    return res.redirect('/login');
-  }
-
-  res.status(401).json({ error: 'Authentication required.' });
-}
-
-// ---------- login page (sets the long-lived cookie) ----------
-// ---------- PWA support: installable app icon, manifest, offline shell ----------
-const ICON_192_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAIAAADdvvtQAAACOklEQVR4nO3doU0DcRyGYUqqkSR0g07QCVgIVVeBqcd0gS6ApL4Kzx7UIDtAFfceOS55Hn//fOLNz95itdvcwVD3Uw9g3gREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIllOPWCIp4fHz5f3X32y3j9//1z+aM+t/79wLC4QiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIZvnLywG+tqfR33z9eDucj6M/Oy8uEImASAREIiASAZEIiERAJAIiERCJgEgERLJY7TZTb2DGXCASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBERyBR9RFQAJnTHxAAAAAElFTkSuQmCC';
-const ICON_512_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7GkOtAAAHbUlEQVR4nO3XoU2DARRGUUqq65qQLtJFKpiBpAZPKrpDB0BjCBJZSXBoZmEGxJ8XuOdM8CVP3LzV7rS/AaDndnoAADMEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACiBAAgSgAAogQAIEoAAKIEACBKAACi1tMDWNzn49vdZjs44OHl6fXrfXDAH+VwLM0HABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQtZ4ewP93OZwvh/P0imXdPx+v3x/TK+B3fAAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUQIAECUAAFECABAlAABRAgAQJQAAUatdaT+9AYABPgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgCgBAIgSAIAoAQCIEgCAKAEAiBIAgKgfwyMYUOBDLJ8AAAAASUVORK5CYII=';
-
-app.get('/manifest.json', (req, res) => {
-  res.json({
-    name: 'LinkedIn Poster',
-    short_name: 'LI Poster',
-    start_url: '/',
-    display: 'standalone',
-    background_color: '#ffffff',
-    theme_color: '#1a7f37',
-    icons: [
-      { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
-      { src: '/icon-512.png', sizes: '512x512', type: 'image/png' }
-    ]
-  });
-});
-app.get('/icon-192.png', (req, res) => {
-  res.set('Content-Type', 'image/png');
-  res.send(Buffer.from(ICON_192_B64, 'base64'));
-});
-app.get('/icon-512.png', (req, res) => {
-  res.set('Content-Type', 'image/png');
-  res.send(Buffer.from(ICON_512_B64, 'base64'));
-});
-app.get('/sw.js', (req, res) => {
-  res.set('Content-Type', 'application/javascript');
-  // Minimal service worker — required for Chrome/Android's "Install app"
-  // prompt to appear. Doesn't cache aggressively since the dashboard's
-  // content (drafts, connection status) needs to always be fresh.
-  res.send(`
-    self.addEventListener('install', () => self.skipWaiting());
-    self.addEventListener('activate', () => self.clients.claim());
-    self.addEventListener('fetch', (event) => {
-      event.respondWith(fetch(event.request).catch(() => new Response('Offline')));
-    });
-  `);
-});
-
-app.get('/login', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black">
-    <meta name="apple-mobile-web-app-title" content="LI Poster">
-    <meta name="theme-color" content="#1a7f37">
-    <link rel="manifest" href="/manifest.json">
-    <link rel="apple-touch-icon" href="/icon-192.png">
-    <link rel="icon" href="/icon-192.png">
-    <title>Sign in — LinkedIn Poster</title>
-    <style>
-      body{font-family:sans-serif;max-width:360px;margin:80px auto;padding:0 16px;}
-      input{width:100%;padding:10px;margin:10px 0;box-sizing:border-box;font-size:16px;}
-      button{width:100%;padding:12px;background:#1a7f37;color:white;border:none;border-radius:6px;font-size:16px;cursor:pointer;}
-      .error{color:#c53030;font-size:13px;}
-    </style>
-    </head>
-    <body>
-      <h2>LinkedIn Poster</h2>
-      <form method="POST" action="/login">
-        <input type="password" name="password" placeholder="Dashboard password" autofocus required>
-        <button type="submit">Sign in</button>
-      </form>
-      ${req.query.error ? '<p class="error">Wrong password — try again.</p>' : ''}
-    </body>
-    </html>
-  `);
-});
-
-app.post('/login', (req, res) => {
-  if (req.body.password === DASHBOARD_PASSWORD) {
-    res.cookie(SESSION_COOKIE, computeSessionToken(), {
-      httpOnly: true,
-      maxAge: 90 * 24 * 60 * 60 * 1000, // 90 days — no repeated logins
-      sameSite: 'lax'
-    });
-    return res.redirect('/');
-  }
-  res.redirect('/login?error=1');
-});
-
-// ---------- OAuth: step 1, send the user to LinkedIn ----------
-app.get('/auth/linkedin', (req, res) => {
-  const state = crypto.randomBytes(16).toString('hex');
-  const scope = encodeURIComponent('openid profile w_member_social');
-  const url = `https://www.linkedin.com/oauth/v2/authorization` +
-    `?response_type=code` +
-    `&client_id=${CLIENT_ID}` +
-    `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
-    `&state=${state}` +
-    `&scope=${scope}`;
-  res.redirect(url);
-});
-
-// ---------- OAuth: step 2, LinkedIn redirects back here with a code ----------
-app.get('/auth/linkedin/callback', async (req, res) => {
-  const { code, error, error_description } = req.query;
-  if (error) return res.status(400).send(`LinkedIn auth failed: ${error_description || error}`);
-
-  try {
-    const tokenRes = await fetch('https://www.linkedin.com/oauth/v2/accessToken', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: REDIRECT_URI,
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET
-      })
-    });
-    const tokenData = await tokenRes.json();
-    if (!tokenData.access_token) {
-      return res.status(400).send(`Token exchange failed: ${JSON.stringify(tokenData)}`);
-    }
-
-    // Get the person's URN (needed as the "author" on every post)
-    const meRes = await fetch('https://api.linkedin.com/v2/userinfo', {
-      headers: { Authorization: `Bearer ${tokenData.access_token}` }
-    });
-    const me = await meRes.json();
-    const personUrn = `urn:li:person:${me.sub}`;
-
-    await saveToken({
-      access_token: tokenData.access_token,
-      expires_at: Date.now() + (tokenData.expires_in * 1000),
-      person_urn: personUrn,
-      name: me.name || null
-    });
-
-    res.send(`
-      <h2>Connected ✓</h2>
-      <p>LinkedIn account <strong>${me.name || ''}</strong> is now authorized.</p>
-      <p>You can close this tab and go to <a href="/">the dashboard</a>.</p>
-    `);
-  } catch (e) {
-    res.status(500).send('Something went wrong exchanging the token: ' + e.message);
-  }
-});
-
-// ---------- status check (used by the Ops Hub app to show connection state) ----------
-app.get('/api/status', requireDashboardAuth, async (req, res) => {
-  const token = await getToken();
-  res.json({
-    connected: !!token,
-    name: token ? token.name : null
-  });
-});
-
-// ---------- list drafts (used by the Ops Hub app to show queue status) ----------
-app.get('/api/drafts', requireDashboardAuth, async (req, res) => {
-  res.json(await getDrafts());
-});
-
-// ---------- add a draft (call this from anywhere, e.g. paste one in from Claude) ----------
-app.post('/api/drafts', requireDashboardAuth, async (req, res) => {
-  const { text, imageUrl, slot, scheduledDate } = req.body;
-  if (!text) return res.status(400).json({ error: 'text is required' });
-  const drafts = await getDrafts();
-  const draft = {
-    id: crypto.randomUUID(),
-    text,
-    imageUrl: imageUrl || null,
-    slot: slot || 'Anytime', // Morning | Midday | Evening | Anytime
-    scheduledDate: scheduledDate || null, // YYYY-MM-DD — which day this is meant for
-    status: 'pending', // pending | posted
-    createdAt: new Date().toISOString()
-  };
-
-  // No image pasted in? Generate one automatically so there's nothing to
-  // hunt down before this can be approved. A failure here doesn't block
-  // the draft — it's just left without an image, same as before, and can
-  // be generated later from the dashboard's "Generate image" button.
-  if (!draft.imageUrl && CF_IMAGE_WORKER_URL) {
-    try {
-      draft.imageUrl = await generateAndHostImage(draft.text, draft.id);
-      draft.imageSource = 'ai-generated';
-    } catch (imgErr) {
-      draft.imageError = (imgErr && imgErr.message) ? imgErr.message : String(imgErr);
-    }
-  }
-
-  drafts.unshift(draft);
-  await saveDrafts(drafts);
-  res.json(draft);
-});
-
-// ---------- generate (or regenerate) the AI image for an existing draft ----------
-app.post('/api/drafts/:id/generate-image', requireDashboardAuth, async (req, res) => {
-  const drafts = await getDrafts();
-  const draft = drafts.find(d => d.id === req.params.id);
-  if (!draft) return res.status(404).json({ error: 'not found' });
-  try {
-    draft.imageUrl = await generateAndHostImage(draft.text, draft.id);
-    draft.imageSource = 'ai-generated';
-    draft.imageError = null;
-    await saveDrafts(drafts);
-    res.json({ ok: true, draft });
-  } catch (e) {
-    draft.imageError = e.message;
-    await saveDrafts(drafts);
-    res.status(502).json({ error: e.message });
-  }
-});
-
-// ---------- bulk import: paste many posts, each gets the next available day ----------
-// Posts are separated by a line containing only "---". Each one is scheduled
-// for the day after the last already-scheduled draft (or today, if none are
-// scheduled yet) — so importing 100 posts fills the next 100 days without
-// clashing with anything already queued.
-app.post('/api/drafts/bulk-import', requireDashboardAuth, async (req, res) => {
-  const { textBlock } = req.body;
-  if (!textBlock || !textBlock.trim()) return res.status(400).json({ error: 'textBlock is required' });
-
-  const posts = textBlock.split(/\n\s*---\s*\n/).map(p => p.trim()).filter(p => p.length > 0);
-  if (posts.length === 0) return res.status(400).json({ error: 'No posts found — separate each one with a line containing only ---' });
-
-  const drafts = await getDrafts();
-  const existingDates = drafts.filter(d => d.scheduledDate).map(d => d.scheduledDate);
-  let startDate = new Date();
-  if (existingDates.length > 0) {
-    const latest = existingDates.sort().slice(-1)[0];
-    startDate = new Date(latest + 'T00:00:00Z');
-    startDate.setUTCDate(startDate.getUTCDate() + 1);
-  }
-
-  // Note: images are NOT auto-generated here, unlike the single-draft path
-  // below. A 100-post import would mean 100 sequential image calls in one
-  // HTTP request, which risks timing out long before it finishes. Each
-  // post still gets its image generated the normal way — via the
-  // "Generate image" button — when you review it ahead of its scheduled day.
-  const newDrafts = posts.map((text, i) => {
-    const d = new Date(startDate);
-    d.setUTCDate(d.getUTCDate() + i);
-    return {
-      id: crypto.randomUUID(),
-      text,
-      imageUrl: null,
-      slot: 'Anytime',
-      scheduledDate: d.toISOString().slice(0, 10),
-      status: 'pending',
-      createdAt: new Date().toISOString()
-    };
-  });
-
-  await saveDrafts([...drafts, ...newDrafts]);
-  res.json({ ok: true, imported: newDrafts.length, firstDate: newDrafts[0].scheduledDate, lastDate: newDrafts[newDrafts.length - 1].scheduledDate });
-});
-
-// ---------- edit a draft before approving ----------
-app.patch('/api/drafts/:id', requireDashboardAuth, async (req, res) => {
-  const drafts = await getDrafts();
-  const draft = drafts.find(d => d.id === req.params.id);
-  if (!draft) return res.status(404).json({ error: 'not found' });
-  if (req.body.text !== undefined) draft.text = req.body.text;
-  if (req.body.imageUrl !== undefined) draft.imageUrl = req.body.imageUrl;
-  if (req.body.slot !== undefined) draft.slot = req.body.slot;
-  await saveDrafts(drafts);
-  res.json(draft);
-});
-
-// ---------- delete a draft you don't want ----------
-app.delete('/api/drafts/:id', requireDashboardAuth, async (req, res) => {
-  let drafts = await getDrafts();
-  drafts = drafts.filter(d => d.id !== req.params.id);
-  await saveDrafts(drafts);
-  res.json({ ok: true });
-});
-
-// ---------- REPLY DRAFTS ----------
-// Comment detection stays manual — LinkedIn doesn't grant read access to
-// comments (r_member_social) to third-party apps. You see a comment on
-// LinkedIn yourself, paste it in here, get/edit a suggested reply, and
-// approving it posts the real reply via the API.
-
-// list reply drafts
-app.get('/api/reply-drafts', requireDashboardAuth, async (req, res) => {
-  res.json(await getReplyDrafts());
-});
-
-// add a reply draft (comment you saw + your target post + a suggested reply)
-app.post('/api/reply-drafts', requireDashboardAuth, async (req, res) => {
-  const { commentText, commentAuthor, targetPostUrn, suggestedReply } = req.body;
-  if (!commentText || !targetPostUrn) {
-    return res.status(400).json({ error: 'commentText and targetPostUrn are required' });
-  }
-  const replyDrafts = await getReplyDrafts();
-  const draft = {
-    id: crypto.randomUUID(),
-    commentText,
-    commentAuthor: commentAuthor || null,
-    targetPostUrn,
-    suggestedReply: suggestedReply || '',
-    status: 'pending',
-    createdAt: new Date().toISOString()
-  };
-  replyDrafts.unshift(draft);
-  await saveReplyDrafts(replyDrafts);
-  res.json(draft);
-});
-
-// edit a reply draft before approving
-app.patch('/api/reply-drafts/:id', requireDashboardAuth, async (req, res) => {
-  const replyDrafts = await getReplyDrafts();
-  const draft = replyDrafts.find(d => d.id === req.params.id);
-  if (!draft) return res.status(404).json({ error: 'not found' });
-  if (req.body.suggestedReply !== undefined) draft.suggestedReply = req.body.suggestedReply;
-  await saveReplyDrafts(replyDrafts);
-  res.json(draft);
-});
-
-// delete a reply draft
-app.delete('/api/reply-drafts/:id', requireDashboardAuth, async (req, res) => {
-  let replyDrafts = await getReplyDrafts();
-  replyDrafts = replyDrafts.filter(d => d.id !== req.params.id);
-  await saveReplyDrafts(replyDrafts);
-  res.json({ ok: true });
-});
-
-// approve & post the reply as a real LinkedIn comment
-app.post('/api/reply-drafts/:id/post', requireDashboardAuth, async (req, res) => {
-  const token = await getToken();
-  if (!token) return res.status(400).json({ error: 'LinkedIn is not connected yet. Visit /auth/linkedin first.' });
-
-  const replyDrafts = await getReplyDrafts();
-  const draft = replyDrafts.find(d => d.id === req.params.id);
-  if (!draft) return res.status(404).json({ error: 'not found' });
-  if (!draft.suggestedReply || !draft.suggestedReply.trim()) {
-    return res.status(400).json({ error: 'Write a reply before approving.' });
-  }
-
-  try {
-    const commentRes = await fetch(
-      `https://api.linkedin.com/rest/socialActions/${encodeURIComponent(draft.targetPostUrn)}/comments`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token.access_token}`,
-          'Content-Type': 'application/json',
-          'LinkedIn-Version': '202608',
-          'X-Restli-Protocol-Version': '2.0.0'
-        },
-        body: JSON.stringify({
-          actor: token.person_urn,
-          message: { text: draft.suggestedReply }
-        })
-      }
-    );
-
-    if (!commentRes.ok) {
-      const errText = await commentRes.text();
-      return res.status(502).json({ error: `LinkedIn rejected the reply (${commentRes.status})`, detail: errText });
-    }
-
-    draft.status = 'posted';
-    draft.postedAt = new Date().toISOString();
-    await saveReplyDrafts(replyDrafts);
-    res.json({ ok: true, draft });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ---------- register + upload an image to LinkedIn, return its URN ----------
-async function uploadImageToLinkedIn(imageUrl, accessToken, personUrn) {
-  // Step 1: tell LinkedIn you want to upload an image, get an upload URL back
-  const initRes = await fetch('https://api.linkedin.com/rest/images?action=initializeUpload', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-      'LinkedIn-Version': '202608',
-      'X-Restli-Protocol-Version': '2.0.0'
-    },
-    body: JSON.stringify({
-      initializeUploadRequest: { owner: personUrn }
-    })
-  });
-  if (!initRes.ok) {
-    const errText = await initRes.text();
-    throw new Error(`LinkedIn rejected the image upload request (${initRes.status}): ${errText}`);
-  }
-  const initData = await initRes.json();
-  if (!initData.value || !initData.value.uploadUrl) {
-    throw new Error(`LinkedIn's image upload response was missing expected fields: ${JSON.stringify(initData)}`);
-  }
-  const uploadUrl = initData.value.uploadUrl;
-  const imageUrn = initData.value.image;
-
-  // Step 2: fetch the image bytes from wherever it currently lives...
-  const imgRes = await fetch(imageUrl);
-  if (!imgRes.ok) {
-    throw new Error(`Could not fetch the image from ${imageUrl} (status ${imgRes.status}) — check the URL is public and correct.`);
-  }
-  const imgBuffer = await imgRes.buffer();
-
-  // ...and PUT them to the URL LinkedIn just gave you
-  const putRes = await fetch(uploadUrl, {
-    method: 'PUT',
-    headers: { Authorization: `Bearer ${accessToken}` },
-    body: imgBuffer
-  });
-  if (!putRes.ok) {
-    const errText = await putRes.text();
-    throw new Error(`Uploading the image bytes to LinkedIn failed (${putRes.status}): ${errText}`);
-  }
-
-  return imageUrn;
-}
-
-// ---------- retry just the blog publish for an already-LinkedIn-posted draft ----------
-app.post('/api/drafts/:id/retry-blog', requireDashboardAuth, async (req, res) => {
-  const drafts = await getDrafts();
-  const draft = drafts.find(d => d.id === req.params.id);
-  if (!draft) return res.status(404).json({ error: 'not found' });
-
-  try {
-    const blogUrl = await publishToWixBlog(draft);
-    draft.blogPublished = true;
-    draft.blogUrl = blogUrl;
-    draft.blogError = null;
-    await saveDrafts(drafts);
-    res.json({ ok: true, draft });
-  } catch (blogErr) {
-    draft.blogPublished = false;
-    draft.blogError = (blogErr && blogErr.message) ? blogErr.message : String(blogErr);
-    await saveDrafts(drafts);
-    res.status(502).json({ error: draft.blogError });
-  }
-});
-
-// ---------- approve: publish the website article first, then post its native link to LinkedIn ----------
-app.post('/api/drafts/:id/post', requireDashboardAuth, async (req, res) => {
-  const token = await getToken();
-  if (!token) return res.status(400).json({ error: 'LinkedIn is not connected yet. Visit /auth/linkedin first.' });
-  const drafts = await getDrafts();
-  const draft = drafts.find(d => d.id === req.params.id);
-  if (!draft) return res.status(404).json({ error: 'not found' });
-  if (!draft.imageUrl || !isValidHttpUrl(draft.imageUrl)) {
-    return res.status(400).json({ error: 'An approved post must have a valid image URL before it can be published.' });
-  }
-  const todayUTC = new Date().toISOString().slice(0, 10);
-  const alreadyPostedToday = drafts.some(d =>
-    d.status === 'posted' && d.postedAt && d.postedAt.slice(0, 10) === todayUTC
-  );
-  if (alreadyPostedToday) {
-    return res.status(429).json({
-      error: `You've already posted to LinkedIn today (${todayUTC}). One post per day — try again tomorrow.`
-    });
-  }
-  try {
-    // Create the real Culinary Essence article before touching LinkedIn.
-    // This prevents a social post from pointing to a missing page.
-    let blogUrl = draft.blogUrl;
-    if (!draft.blogPublished || !blogUrl) {
-      blogUrl = await publishToWixBlog(draft);
-      if (!blogUrl) throw new Error('Wix published the post but did not return a page URL.');
-      draft.blogPublished = true;
-      draft.blogUrl = blogUrl;
-      draft.blogError = null;
-    }
-    const trackedBlogUrl = addTrackingParams(blogUrl, draft);
-    draft.trackedBlogUrl = trackedBlogUrl;
-
-    // LinkedIn article posts require a source URL. Upload the approved image
-    // as the article thumbnail so the preview is a native clickable link post.
-    const imageUrn = await uploadImageToLinkedIn(draft.imageUrl, token.access_token, token.person_urn);
-    const postBody = {
-      author: token.person_urn,
-      commentary: draft.text,
-      visibility: 'PUBLIC',
-      distribution: { feedDistribution: 'MAIN_FEED', targetEntities: [], thirdPartyDistributionChannels: [] },
-      lifecycleState: 'PUBLISHED',
-      isReshareDisabledByAuthor: false,
-      content: {
-        article: {
-          source: trackedBlogUrl,
-          title: getDraftTitle(draft),
-          description: getDraftExcerpt(draft),
-          thumbnail: imageUrn
-        }
-      }
-    };
-    const postRes = await fetch('https://api.linkedin.com/rest/posts', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token.access_token}`,
-        'Content-Type': 'application/json',
-        'LinkedIn-Version': '202608',
-        'X-Restli-Protocol-Version': '2.0.0'
-      },
-      body: JSON.stringify(postBody)
-    });
-    if (!postRes.ok) {
-      const errText = await postRes.text();
-      draft.blogError = null;
-      await saveDrafts(drafts);
-      return res.status(502).json({ error: 'LinkedIn rejected the native article post; the website page remains live.', detail: errText, draft });
-    }
-    const postUrn = postRes.headers.get('x-restli-id') || postRes.headers.get('x-linkedin-id');
-    draft.linkedinPostUrn = postUrn || null;
-    draft.linkedinPostUrl = postUrn
-      ? `https://www.linkedin.com/feed/update/${encodeURIComponent(postUrn)}/`
-      : null;
-    draft.status = 'posted';
-    draft.postedAt = new Date().toISOString();
-    await saveDrafts(drafts);
-    res.json({ ok: true, draft });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-
-// ---------- the approval dashboard itself ----------
-app.get('/', requireDashboardAuth, async (req, res) => {
-  const token = await getToken();
-  const drafts = await getDrafts();
-  const replyDrafts = await getReplyDrafts();
-
-  const SLOTS = ['Morning', 'Midday', 'Evening', 'Anytime'];
-  const slotColor = { Morning:'#fff4e5', Midday:'#e5f4ff', Evening:'#f0e5ff', Anytime:'#f0f0f0' };
-
-  // Once-a-day rule, reflected in the UI too — not just enforced server-side
-  // after you click.
-  const todayUTC = new Date().toISOString().slice(0, 10);
-  const alreadyPostedToday = drafts.some(d => d.status === 'posted' && d.postedAt && d.postedAt.slice(0, 10) === todayUTC);
-
-  function draftCard(d) {
-    return `
-    <div class="card ${d.status === 'posted' ? 'posted' : ''}" style="border-left:5px solid ${d.status==='posted' ? '#ccc' : (slotColor[d.slot] ? '#00000022' : '#ccc')};">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
-        <span class="slot-badge" style="background:${slotColor[d.slot] || '#f0f0f0'};padding:3px 10px;border-radius:12px;font-size:12px;">${d.slot || 'Anytime'}</span>
-        ${d.status !== 'posted' ? `
-          <select onchange="changeSlot('${d.id}', this.value)" style="font-size:12px;padding:3px 6px;">
-            ${SLOTS.map(s => `<option value="${s}" ${d.slot===s?'selected':''}>${s}</option>`).join('')}
-          </select>
-        ` : ''}
-      </div>
-      <textarea data-id="${d.id}" ${d.status === 'posted' ? 'readonly' : ''}>${escapeHtml(d.text)}</textarea>
-      ${d.status !== 'posted' ? `
-        <input type="text" data-image-id="${d.id}" value="${(d.imageUrl||'').replace(/"/g,'&quot;')}" placeholder="Image URL (auto-generated — paste one here only to override)" style="width:100%;padding:8px;margin-top:8px;box-sizing:border-box;font-size:13px;">
-        <button type="button" onclick="generateImage('${d.id}')" style="margin-top:6px;background:#444;color:white;">${d.imageUrl ? 'Regenerate image' : 'Generate image'}</button>
-      ` : ''}
-      ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:200px;display:block;margin:8px 0;">` : ''}
-      ${d.imageError ? `<p style="font-size:12px;color:#c53030;margin:6px 0;">Image generation failed: ${escapeHtml(d.imageError)} — try "Generate image" again, or paste a URL above.</p>` : ''}
-      ${!d.imageUrl && !d.imageError && d.status !== 'posted' ? '<p style="font-size:12px;color:#666;margin:6px 0;">No image yet — click "Generate image" above.</p>' : ''}
-      <div class="meta">
-        ${d.scheduledDate ? '📅 Scheduled for ' + d.scheduledDate + '<br>' : ''}
-        ${d.status === 'posted'
-          ? '✓ Posted to LinkedIn ' + d.postedAt + (d.linkedinPostUrl ? ' — <a href="' + d.linkedinPostUrl + '" target="_blank">view post</a>' : ' <span style="color:#c53030;">(no post link captured — verify manually)</span>')
-          : 'Pending review'}
-        ${d.status === 'posted' ? (d.blogPublished
-            ? '<br>✓ Blog post live' + (d.blogUrl ? ': <a href="' + d.blogUrl + '" target="_blank">' + d.blogUrl + '</a>' : '')
-            : '<br>⚠ Blog publish failed: ' + (d.blogError || 'unknown error'))
-          : ''}
-      </div>
-      ${d.status !== 'posted' ? `
-        <button onclick="saveDraft('${d.id}')">Save edits</button>
-        ${alreadyPostedToday
-          ? '<button disabled title="Already posted today — one post per day" style="opacity:0.5;cursor:not-allowed;">Approve &amp; Post (limit reached today)</button>'
-          : `<button onclick="postDraft('${d.id}')" class="post-btn">Approve &amp; Post</button>`}
-        <button onclick="deleteDraft('${d.id}')" class="delete-btn">Delete</button>
-      ` : ''}
-      ${d.status === 'posted' && !d.blogPublished ? `
-        <button onclick="retryBlog('${d.id}')" class="post-btn">Retry blog publish</button>
-      ` : ''}
-    </div>
-  `;
-  }
-
-  const pending = drafts.filter(d => d.status !== 'posted');
-  const posted = drafts.filter(d => d.status === 'posted');
-
-  const scheduled = pending.filter(d => d.scheduledDate).sort((a, b) => a.scheduledDate.localeCompare(b.scheduledDate));
-  const unscheduled = pending.filter(d => !d.scheduledDate);
-
-  const todaysDraft = scheduled.find(d => d.scheduledDate === todayUTC);
-  const overdueDrafts = scheduled.filter(d => d.scheduledDate < todayUTC);
-  const upcomingDrafts = scheduled.filter(d => d.scheduledDate > todayUTC);
-
-  const todaySection = todaysDraft
-    ? `<div style="border:2px solid #1a7f37;border-radius:10px;padding:4px;margin-bottom:24px;"><h3 style="margin:10px 0 10px 10px;">📌 Today's post (${todayUTC})</h3>${draftCard(todaysDraft)}</div>`
-    : `<div class="status" style="background:#f0f0f0;color:#555;">No post scheduled for today (${todayUTC}).</div>`;
-
-  const overdueSection = overdueDrafts.length
-    ? `<h4 style="margin-top:20px;color:#c53030;">⚠ Overdue (${overdueDrafts.length}) — missed days, still pending</h4>${overdueDrafts.map(draftCard).join('')}`
-    : '';
-
-  const upcomingPreview = upcomingDrafts.slice(0, 5);
-  const upcomingRemainingCount = upcomingDrafts.length - upcomingPreview.length;
-  const upcomingSection = upcomingDrafts.length
-    ? `<h4 style="margin-top:20px;">Next up</h4>${upcomingPreview.map(d => `<div class="card" style="padding:10px 14px;"><strong>${d.scheduledDate}</strong> — ${escapeHtml(d.text.slice(0,80))}${d.text.length>80?'...':''}</div>`).join('')}
-       ${upcomingRemainingCount > 0 ? `<p style="font-size:13px;color:#666;">...and ${upcomingRemainingCount} more scheduled through ${upcomingDrafts[upcomingDrafts.length-1].scheduledDate}.</p>` : ''}`
-    : '';
-
-  const pendingBySlot = SLOTS.map(slot => {
-    const items = unscheduled.filter(d => (d.slot || 'Anytime') === slot);
-    if (items.length === 0) return '';
-    return `<h4 style="margin-top:20px;">${slot}</h4>${items.map(draftCard).join('')}`;
-  }).join('');
-
-  const postedHtml = posted.length ? `<h3 style="margin-top:30px;">Posted</h3>${posted.map(draftCard).join('')}` : '';
-
-  const postedWithLinkedInUrn = posted.filter(d => d.linkedinPostUrn);
-  const targetOptions = postedWithLinkedInUrn.map(d =>
-    `<option value="${escapeHtml(d.linkedinPostUrn)}">${escapeHtml(d.text.slice(0, 60))}...</option>`
-  ).join('');
-
-  function replyCard(rd) {
-    const targetLabel = postedWithLinkedInUrn.find(d => d.linkedinPostUrn === rd.targetPostUrn);
-    return `
-    <div class="card ${rd.status === 'posted' ? 'posted' : ''}">
-      <div class="meta" style="margin-bottom:8px;">
-        <strong>Comment${rd.commentAuthor ? ' from ' + escapeHtml(rd.commentAuthor) : ''}:</strong><br>
-        "${escapeHtml(rd.commentText)}"
-        <br><span style="font-size:11px;">On: ${targetLabel ? escapeHtml(targetLabel.text.slice(0,50)) : rd.targetPostUrn}</span>
-      </div>
-      <textarea data-reply-id="${rd.id}" placeholder="Write or edit the reply..." ${rd.status === 'posted' ? 'readonly' : ''}>${escapeHtml(rd.suggestedReply)}</textarea>
-      <div class="meta">${rd.status === 'posted' ? '✓ Reply posted ' + rd.postedAt : 'Pending review'}</div>
-      ${rd.status !== 'posted' ? `
-        <button onclick="saveReply('${rd.id}')">Save edits</button>
-        <button onclick="postReply('${rd.id}')" class="post-btn">Approve &amp; Reply</button>
-        <button onclick="deleteReply('${rd.id}')" class="delete-btn">Delete</button>
-      ` : ''}
-    </div>
-  `;
-  }
-
-  const pendingReplies = replyDrafts.filter(d => d.status !== 'posted');
-  const postedReplies = replyDrafts.filter(d => d.status === 'posted');
-  const replyDraftsHtml = pendingReplies.map(replyCard).join('') || '<p>No pending reply drafts.</p>';
-  const postedRepliesHtml = postedReplies.length ? `<h4 style="margin-top:20px;">Posted replies</h4>${postedReplies.map(replyCard).join('')}` : '';
-
-  const replySection = `
-    <h3 style="margin-top:40px;">Reply Drafts</h3>
-    <p style="font-size:13px;color:#666;">Comment detection is manual — LinkedIn doesn't allow reading comments via API for this app. Saw a comment worth replying to? Paste it below.</p>
-    <form class="new-draft" onsubmit="return addReply(event)">
-      <h4>New reply draft</h4>
-      ${postedWithLinkedInUrn.length === 0 ? '<p style="color:#c53030;font-size:13px;">No posts with a captured LinkedIn link yet — post something first so there\'s something to reply on.</p>' : `
-        <select id="replyTarget" style="width:100%;padding:8px;margin-bottom:8px;">${targetOptions}</select>
-        <input id="commentAuthor" type="text" placeholder="Who commented (optional)" style="width:100%;padding:8px;margin-bottom:8px;box-sizing:border-box;">
-        <textarea id="commentText" placeholder="Paste the comment text here..." style="min-height:60px;"></textarea>
-        <textarea id="suggestedReply" placeholder="Your reply (write it here, or paste a suggestion)..." style="margin-top:8px;min-height:60px;"></textarea>
-        <button type="submit">Add to queue</button>
-      `}
-    </form>
-    ${replyDraftsHtml}
-    ${postedRepliesHtml}
-  `;
-
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
-      <meta name="apple-mobile-web-app-capable" content="yes">
-      <meta name="apple-mobile-web-app-status-bar-style" content="black">
-      <meta name="apple-mobile-web-app-title" content="LI Poster">
-      <meta name="theme-color" content="#1a7f37">
-      <link rel="manifest" href="/manifest.json">
-      <link rel="apple-touch-icon" href="/icon-192.png">
-      <link rel="icon" href="/icon-192.png">
-      <title>LinkedIn Poster</title>
-      <style>
-        *{box-sizing:border-box;}
-        body{font-family:sans-serif;max-width:700px;margin:20px auto;padding:0 16px;}
-        .status{padding:10px;border-radius:6px;margin-bottom:20px;}
-        .connected{background:#e6f4ea;color:#1e4620;}
-        .not-connected{background:#fdeaea;color:#7a1f1f;}
-        .card{border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:14px;}
-        .card.posted{opacity:0.6;}
-        textarea{width:100%;min-height:100px;font-family:inherit;font-size:16px;padding:8px;box-sizing:border-box;}
-        input,select{font-size:16px;}
-        button{margin-top:8px;margin-right:6px;padding:10px 16px;border-radius:6px;border:none;cursor:pointer;font-size:15px;min-height:44px;}
-        .post-btn{background:#1a7f37;color:white;}
-        .delete-btn{background:#c53030;color:white;}
-        .meta{font-size:12px;color:#666;margin-top:6px;}
-        form.new-draft{border:1px dashed #aaa;border-radius:8px;padding:14px;margin-bottom:24px;}
-        @media (max-width:480px){
-          body{margin:10px auto;padding:0 12px;}
-          h1{font-size:22px;}
-          h3{font-size:17px;}
-          button{width:100%;margin-right:0;}
-        }
-      </style>
-    </head>
-    <body>
-      <h1>LinkedIn Poster</h1>
-      <div class="status ${token ? 'connected' : 'not-connected'}">
-        ${token ? `Connected as <strong>${token.name || 'your LinkedIn account'}</strong>` : `Not connected — <a href="/auth/linkedin">connect LinkedIn</a> first.`}
-      </div>
-      ${alreadyPostedToday ? `<div class="status" style="background:#fff4e5;color:#7a4a00;">One post per day — you've already posted today (${todayUTC}). Next post unlocks tomorrow.</div>` : ''}
-
-      ${todaySection}
-      ${overdueSection}
-      ${upcomingSection}
-
-      <details style="margin:24px 0;">
-        <summary style="cursor:pointer;font-weight:bold;">Bulk import a series (e.g. 100 posts, one per day)</summary>
-        <form class="new-draft" onsubmit="return bulkImport(event)" style="margin-top:12px;">
-          <p style="font-size:13px;color:#666;">Paste all your posts below, separating each one with a line containing only <code>---</code>. The first one gets scheduled for the next open day, and each one after gets the following day.</p>
-          <textarea id="bulkText" placeholder="Post 1 text...&#10;&#10;---&#10;&#10;Post 2 text...&#10;&#10;---&#10;&#10;Post 3 text..." style="min-height:160px;"></textarea>
-          <button type="submit">Import series</button>
-        </form>
-      </details>
-
-      <form class="new-draft" onsubmit="return addDraft(event)">
-        <h3>New draft (one-off, unscheduled)</h3>
-        <textarea id="newText" placeholder="Paste or write the post text here..."></textarea>
-        <input id="newImage" type="text" placeholder="Image URL (leave blank — one will be generated automatically)" style="width:100%;padding:8px;margin-top:8px;box-sizing:border-box;">
-        <select id="newSlot" style="width:100%;padding:8px;margin-top:8px;box-sizing:border-box;">
-          ${SLOTS.map(s => `<option value="${s}">${s}</option>`).join('')}
-        </select>
-        <button type="submit">Add to queue</button>
-      </form>
-
-      ${pendingBySlot ? `<h3>Other pending (unscheduled)</h3>${pendingBySlot}` : ''}
-      ${postedHtml}
-      ${replySection}
-
-      <script>
-        // The session cookie (set once at /login) authenticates these
-        // requests automatically — no more password prompts here.
-        async function changeSlot(id, slot){
-          await fetch('/api/drafts/'+id, {
-            method:'PATCH',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({slot})
-          });
-          location.reload();
-        }
-        async function addDraft(e){
-          e.preventDefault();
-          const text = document.getElementById('newText').value;
-          const imageUrl = document.getElementById('newImage').value;
-          const slot = document.getElementById('newSlot').value;
-          await fetch('/api/drafts', {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({text, imageUrl, slot})
-          });
-          location.reload();
-        }
-        async function bulkImport(e){
-          e.preventDefault();
-          const textBlock = document.getElementById('bulkText').value;
-          if(!textBlock.trim()) return;
-          const res = await fetch('/api/drafts/bulk-import', {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({textBlock})
-          });
-          const data = await res.json();
-          if(data.error){ alert('Import failed: ' + data.error); return; }
-          alert('Imported ' + data.imported + ' posts, scheduled ' + data.firstDate + ' through ' + data.lastDate + '.');
-          location.reload();
-        }
-        async function saveDraft(id){
-          const text = document.querySelector('textarea[data-id="'+id+'"]').value;
-          const imageInput = document.querySelector('input[data-image-id="'+id+'"]');
-          const imageUrl = imageInput ? imageInput.value : undefined;
-          await fetch('/api/drafts/'+id, {
-            method:'PATCH',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({text, imageUrl})
-          });
-          location.reload();
-        }
-        async function generateImage(id){
-          const res = await fetch('/api/drafts/'+id+'/generate-image', {method:'POST'});
-          const data = await res.json();
-          if(data.error){ alert('Image generation failed: ' + data.error); return; }
-          location.reload();
-        }
-        async function postDraft(id){
-          const imageInput = document.querySelector('input[data-image-id="'+id+'"]');
-          const hasImage = imageInput && imageInput.value.trim().length > 0;
-          const msg = hasImage ? 'Post this to LinkedIn now?' : 'No image yet — generate one first, or post anyway without one?';
-          if(!confirm(msg)) return;
-          await fetch('/api/drafts/'+id, {
-            method:'PATCH',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({imageUrl: imageInput ? imageInput.value : undefined})
-          });
-          const res = await fetch('/api/drafts/'+id+'/post', {method:'POST'});
-          const data = await res.json();
-          if(data.error){ alert('Failed: ' + JSON.stringify(data)); return; }
-          location.reload();
-        }
-        async function deleteDraft(id){
-          if(!confirm('Delete this draft?')) return;
-          await fetch('/api/drafts/'+id, {method:'DELETE'});
-          location.reload();
-        }
-        async function retryBlog(id){
-          const res = await fetch('/api/drafts/'+id+'/retry-blog', {method:'POST'});
-          const data = await res.json();
-          if(data.error){ alert('Blog retry failed: ' + data.error); }
-          location.reload();
-        }
-        async function addReply(e){
-          e.preventDefault();
-          const targetPostUrn = document.getElementById('replyTarget').value;
-          const commentAuthor = document.getElementById('commentAuthor').value;
-          const commentText = document.getElementById('commentText').value;
-          const suggestedReply = document.getElementById('suggestedReply').value;
-          const res = await fetch('/api/reply-drafts', {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({targetPostUrn, commentAuthor, commentText, suggestedReply})
-          });
-          const data = await res.json();
-          if(data.error){ alert('Failed: ' + data.error); return; }
-          location.reload();
-        }
-        async function saveReply(id){
-          const suggestedReply = document.querySelector('textarea[data-reply-id="'+id+'"]').value;
-          await fetch('/api/reply-drafts/'+id, {
-            method:'PATCH',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({suggestedReply})
-          });
-          alert('Saved.');
-        }
-        async function postReply(id){
-          if(!confirm('Post this reply to LinkedIn now?')) return;
-          const res = await fetch('/api/reply-drafts/'+id+'/post', {method:'POST'});
-          const data = await res.json();
-          if(data.error){ alert('Failed: ' + JSON.stringify(data)); return; }
-          location.reload();
-        }
-        async function deleteReply(id){
-          if(!confirm('Delete this reply draft?')) return;
-          await fetch('/api/reply-drafts/'+id, {method:'DELETE'});
-          location.reload();
-        }
-        if ('serviceWorker' in navigator) {
-          navigator.serviceWorker.register('/sw.js').catch(()=>{});
-        }
-      </script>
-    </body>
-    </html>
-  `);
-});
-
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-app.listen(PORT, () => {
-  console.log(`LinkedIn Poster running on http://localhost:${PORT}`);
-  console.log(`If LinkedIn isn't connected yet, visit http://localhost:${PORT}/auth/linkedin`);
-});
