@@ -106,10 +106,8 @@ app.post('/api/drafts', requireDashboardAuth, async (req, res) => {
   const { text, imageUrl } = req.body;
   if (!text) return res.status(400).json({ error: 'text is required' });
 
-  // 1. Format raw post into strict technical LinkedIn structure
   const formattedPostText = await formatLinkedInPost(text);
 
-  // 2. Transform formatted post text into an infographic/chart prompt if no direct image URL is provided
   let finalPrompt = formattedPostText;
   if (!imageUrl) {
     finalPrompt = await createVisualPrompt(formattedPostText);
