@@ -1,0 +1,2 @@
+touch culinary_essence_100_days.md
+open -e culinary_essence_100_days.md
