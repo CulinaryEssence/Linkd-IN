@@ -129,7 +129,8 @@ app.post('/api/admin/upgrade-all-posts', requireDashboardAuth, async (req, res) 
     let updatedCount = 0;
 
     for (let i = 0; i < drafts.length; i++) {
-      if (drafts[i].status === 'pending') {
+      // Upgrades any draft that is not explicitly marked as published
+      if (drafts[i].status !== 'published') {
         const formattedText = await formatLinkedInPost(drafts[i].text);
         const visualPrompt = await createVisualPrompt(formattedText);
         drafts[i].text = formattedText;
@@ -138,6 +139,13 @@ app.post('/api/admin/upgrade-all-posts', requireDashboardAuth, async (req, res) 
         updatedCount++;
       }
     }
+
+    saveDrafts(drafts);
+    res.json({ success: true, upgraded: updatedCount });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to upgrade posts' });
+  }
+});
 
     saveDrafts(drafts);
     res.json({ success: true, upgraded: updatedCount });
