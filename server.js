@@ -4,9 +4,25 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
+
+// Set CORS and CSP headers to allow local API requests
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data:; connect-src 'self' https:;"
+  );
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json());
 
-// Serve static frontend files so "Cannot GET /" goes away
+// Serve static UI files
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.static(__dirname));
 
@@ -91,13 +107,15 @@ async function formatLinkedInPost(rawInput) {
   }
 }
 
-// Ensure home page loads correctly
+// Fallback home page handler
 app.get('/', (req, res) => {
   const indexPath = path.join(__dirname, 'index.html');
   if (fs.existsSync(indexPath)) {
     res.sendFile(indexPath);
-  } else {
+  } else if (fs.existsSync(path.join(__dirname, 'public', 'index.html'))) {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } else {
+    res.send('Server running. Upgrade endpoint ready at /api/admin/upgrade-all-posts');
   }
 });
 
