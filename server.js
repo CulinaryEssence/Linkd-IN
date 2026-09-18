@@ -1,3 +1,38 @@
+const express = require('express');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+app.use(express.json());
+
+// Path to storage file (adjust if using PostgreSQL or custom storage module)
+const DB_FILE = path.join(__dirname, 'app_storage.json');
+
+function getDrafts() {
+  try {
+    if (!fs.existsSync(DB_FILE)) return [];
+    const data = fs.readFileSync(DB_FILE, 'utf8');
+    return JSON.parse(data);
+  } catch (e) {
+    console.error('Error reading storage:', e);
+    return [];
+  }
+}
+
+function saveDrafts(drafts) {
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(drafts, null, 2), 'utf8');
+  } catch (e) {
+    console.error('Error writing storage:', e);
+  }
+}
+
+// Simple authentication middleware mockup (bypasses or validates session)
+function requireDashboardAuth(req, res, next) {
+  next();
+}
+
 // =====================================================================
 // Dynamic Infographic & Chart Prompt Transformer (LLM Step)
 // =====================================================================
@@ -96,12 +131,12 @@ async function formatLinkedInPost(rawInput) {
   }
 }
 
-// ---------- list drafts (used by the Ops Hub app to show queue status) ----------
+// ---------- list drafts ----------
 app.get('/api/drafts', requireDashboardAuth, (req, res) => {
   res.json(getDrafts());
 });
 
-// ---------- add a draft (formats LinkedIn post text and generates dynamic visual prompt) ----------
+// ---------- add a draft ----------
 app.post('/api/drafts', requireDashboardAuth, async (req, res) => {
   const { text, imageUrl } = req.body;
   if (!text) return res.status(400).json({ error: 'text is required' });
@@ -151,4 +186,9 @@ app.post('/api/admin/upgrade-all-posts', requireDashboardAuth, async (req, res) 
     console.error('Bulk upgrade failed:', e);
     res.status(500).json({ error: 'Failed to bulk upgrade posts' });
   }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
