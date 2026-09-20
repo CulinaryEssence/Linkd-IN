@@ -529,6 +529,32 @@ app.get('/images/:file', requireDashboardAuth, async (req, res) => {
   res.type('png').send(buf);
 });
 
+app.post('/api/drafts/:id/visual-prompt', requireDashboardAuth, async (req, res) => {
+  const drafts = getDrafts();
+  const draft = drafts.find(d => d.id === req.params.id);
+  if (!draft) return res.status(404).json({ error: 'not found' });
+  try {
+    draft.visualPrompt = await createVisualPrompt(draft.text);
+    saveDrafts(drafts);
+    res.json({ ok: true, visualPrompt: draft.visualPrompt });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+app.post('/api/drafts/:id/upload-image', requireDashboardAuth, express.json({ limit: '15mb' }), async (req, res) => {
+  const drafts = getDrafts();
+  const draft = drafts.find(d => d.id === req.params.id);
+  if (!draft) return res.status(404).json({ error: 'not found' });
+  const m = /^data:image\/(png|jpe?g);base64,(.+)$/.exec(String(req.body && req.body.data || ''));
+  if (!m) return res.status(400).json({ error: 'Send a PNG or JPG image.' });
+  const name = `${draft.id}-${Date.now()}.png`;
+  await saveImageBuffer(name, Buffer.from(m[2], 'base64'));
+  draft.imageUrl = '/images/' + name;
+  saveDrafts(drafts);
+  res.json({ ok: true, imageUrl: draft.imageUrl });
+});
+
 app.post('/api/drafts/:id/generate-image', requireDashboardAuth, async (req, res) => {
   if (!process.env.CF_IMAGE_WORKER_URL && !process.env.GEMINI_API_KEY && !process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'No image provider configured.' });
   const drafts = getDrafts();
@@ -670,11 +696,15 @@ app.get('/', requireDashboardAuth, (req, res) => {
   const draftCards = drafts.map(d => `
     <div class="card ${d.status === 'posted' ? 'posted' : ''}">
       <textarea data-id="${d.id}" ${d.status === 'posted' ? 'readonly' : ''}>${escapeHtml(d.text)}</textarea>
-      ${d.visualPrompt ? `<div class="meta" style="margin-top:4px;color:#2b6cb0;"><strong>Visual Prompt:</strong> ${escapeHtml(d.visualPrompt)}</div>` : ''}
+      ${d.visualPrompt ? `<div class="meta" style="margin-top:4px;color:#2b6cb0;"><strong>Visual Prompt:</strong> <span id="vp-${d.id}">${escapeHtml(d.visualPrompt)}</span></div>` : ''}
       ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:320px;display:block;margin:8px 0;">` : ''}
       <div class="meta">${d.status === 'posted' ? '✓ Posted ' + d.postedAt : 'Pending review'}</div>
       ${d.status !== 'posted' ? `
-        <button onclick="generateImage('${d.id}', this)">${d.imageUrl ? 'Regenerate image' : 'Generate image'}</button>
+        <button onclick="getPrompt('${d.id}', this)">${d.visualPrompt ? 'New visual prompt' : 'Get visual prompt'}</button>
+        ${d.visualPrompt ? `<button onclick="copyPrompt('${d.id}', this)">Copy prompt</button>` : ''}
+        <button onclick="pickImage('${d.id}')">Upload image</button>
+        <input type="file" id="file-${d.id}" accept="image/*" style="display:none" onchange="uploadImage('${d.id}', this)">
+        <button onclick="generateImage('${d.id}', this)">Quick AI image (basic)</button>
         <button onclick="saveDraft('${d.id}')">Save edits</button>
         <button onclick="postDraft('${d.id}')" class="post-btn">Approve &amp; Post</button>
         <button onclick="deleteDraft('${d.id}')" class="delete-btn">Delete</button>
@@ -743,6 +773,34 @@ app.get('/', requireDashboardAuth, (req, res) => {
             body: JSON.stringify({text})
           });
           alert('Saved.');
+        }
+        async function getPrompt(id, btn){
+          btn.disabled = true; btn.textContent = 'Working...';
+          const res = await fetch('/api/drafts/'+id+'/visual-prompt', {method:'POST'});
+          const data = await res.json();
+          if(data.error){ alert('Failed: ' + data.error); btn.disabled = false; btn.textContent = 'Get visual prompt'; return; }
+          location.reload();
+        }
+        async function copyPrompt(id, btn){
+          const t = document.getElementById('vp-'+id).innerText;
+          try { await navigator.clipboard.writeText(t); btn.textContent = 'Copied'; }
+          catch(e){ prompt('Copy this prompt:', t); }
+        }
+        function pickImage(id){ document.getElementById('file-'+id).click(); }
+        async function uploadImage(id, input){
+          const f = input.files[0]; if(!f) return;
+          const img = new Image();
+          img.onload = async () => {
+            const max = 1600, sc = Math.min(1, max / Math.max(img.width, img.height));
+            const c = document.createElement('canvas');
+            c.width = Math.round(img.width * sc); c.height = Math.round(img.height * sc);
+            c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+            const res = await fetch('/api/drafts/'+id+'/upload-image', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({data: c.toDataURL('image/png')})});
+            const data = await res.json();
+            if(data.error){ alert('Failed: ' + data.error); return; }
+            location.reload();
+          };
+          img.src = URL.createObjectURL(f);
         }
         async function generateImage(id, btn){
           btn.disabled = true; btn.textContent = 'Generating (30-60s)...';
