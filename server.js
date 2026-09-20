@@ -171,7 +171,7 @@ async function geminiGenerate(model, body) {
   return data;
 }
 async function geminiText(system, user) {
-  const model = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash';
+  const model = process.env.GEMINI_TEXT_MODEL || 'gemini-3.6-flash';
   const data = await geminiGenerate(model, {
     systemInstruction: { parts: [{ text: system }] },
     contents: [{ role: 'user', parts: [{ text: user }] }]
@@ -507,6 +507,22 @@ async function requestImage(model, prompt) {
   throw new Error('No image returned');
 }
 
+async function cfImage(prompt) {
+  const url = process.env.CF_IMAGE_WORKER_URL;
+  const secret = process.env.CF_IMAGE_WORKER_SECRET;
+  if (!url || !secret) throw new Error('CF_IMAGE_WORKER_URL/CF_IMAGE_WORKER_SECRET not set');
+  const p = 'Clean technical infographic, modern vector illustration, blueprint style, no plated food photography, no text: ' + String(prompt).replace(/\s+/g, ' ').slice(0, 600);
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: p })
+  });
+  if (!r.ok) throw new Error(`worker ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  const d = await r.json();
+  if (!d || !d.image) throw new Error('worker returned no image');
+  return Buffer.from(d.image, 'base64');
+}
+
 app.get('/images/:file', requireDashboardAuth, async (req, res) => {
   const buf = await loadImageBuffer(req.params.file);
   if (!buf) return res.status(404).end();
@@ -514,7 +530,7 @@ app.get('/images/:file', requireDashboardAuth, async (req, res) => {
 });
 
 app.post('/api/drafts/:id/generate-image', requireDashboardAuth, async (req, res) => {
-  if (!process.env.GEMINI_API_KEY && !process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'Set GEMINI_API_KEY (or OPENAI_API_KEY) on the server.' });
+  if (!process.env.CF_IMAGE_WORKER_URL && !process.env.GEMINI_API_KEY && !process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'No image provider configured.' });
   const drafts = getDrafts();
   const draft = drafts.find(d => d.id === req.params.id);
   if (!draft) return res.status(404).json({ error: 'not found' });
@@ -523,7 +539,15 @@ app.post('/api/drafts/:id/generate-image', requireDashboardAuth, async (req, res
     const prompt = draft.visualPrompt || await createVisualPrompt(draft.text);
     let buf = null;
     const errors = [];
-    if (process.env.GEMINI_API_KEY) {
+    if (process.env.CF_IMAGE_WORKER_URL) {
+      try {
+        buf = await cfImage(prompt);
+      } catch (e) {
+        console.error('cf image failed: ' + e.message);
+        errors.push('cf: ' + e.message);
+      }
+    }
+    if (!buf && process.env.GEMINI_API_KEY) {
       try {
         buf = await geminiImage(prompt);
       } catch (e) {
