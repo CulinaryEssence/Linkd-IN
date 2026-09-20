@@ -511,7 +511,7 @@ async function cfImage(prompt) {
   const url = process.env.CF_IMAGE_WORKER_URL;
   const secret = process.env.CF_IMAGE_WORKER_SECRET;
   if (!url || !secret) throw new Error('CF_IMAGE_WORKER_URL/CF_IMAGE_WORKER_SECRET not set');
-  const p = 'Clean technical infographic, modern vector illustration, blueprint style, no plated food photography, no text: ' + String(prompt).replace(/\s+/g, ' ').slice(0, 600);
+  const p = 'Sharp clean flat vector illustration, technical diagram made only of shapes, icons, arrows and color zones. ABSOLUTELY NO text, NO letters, NO words, NO numbers, NO labels, NO captions. No plated food photography. Subject: ' + String(prompt).replace(/\s+/g, ' ').slice(0, 450);
   const r = await fetch(url, {
     method: 'POST',
     headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
