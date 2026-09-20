@@ -195,7 +195,7 @@ async function geminiImage(prompt) {
 // AI Transformation Step 1: Technical Visual Prompt Generator
 // =====================================================================
 // Saved house style: makes generated images look like real, natural photographs.
-const NATURAL_PHOTO_STYLE = 'Candid documentary photograph taken on a real phone or DSLR in an actual working commercial kitchen, not a studio. Natural window light mixed with ordinary overhead kitchen light, slight uneven exposure, soft real shadows. Real-world imperfections: scratched stainless steel, worn wooden or plastic cutting board, water droplets, flour dust, small crumbs, fingerprints, uneven food edges, irregular natural shapes and colors. Accurate food physics and texture, visible grain and pores, muted true-to-life colors, natural depth of field, slightly off-center snapshot composition. Avoid: glossy or plastic surfaces, over-smooth textures, oversaturated or neon color, perfect symmetry, cinematic glow, HDR, studio backdrop, floating or duplicated objects, distorted hands or fruit shapes, illustration, 3D render, CGI, and any text, letters, numbers or logos.';
+const NATURAL_PHOTO_STYLE = 'Candid documentary photograph taken on a real phone or DSLR in an actual working commercial kitchen. Natural window light mixed with ordinary overhead kitchen light, soft real shadows, slightly uneven exposure. Worn wooden or scratched stainless steel surface with water droplets, flour dust, small crumbs and fingerprints. Irregular natural shapes and colors, accurate food texture with visible grain and pores, muted true-to-life colors, matte natural finish, natural depth of field, gentle film grain, slightly off-center snapshot composition, square 1:1 frame.';
 
 // Three-stage prompt builder: (1) pull the physical facts out of the post, (2) write a prompt that
 // states each fact as a hard requirement, (3) audit the prompt against the facts and fix any gap.
@@ -203,38 +203,46 @@ function parseJson(t) {
   return JSON.parse(String(t).replace(/```json|```/g, '').trim());
 }
 
-async function composeFaithfulPrompt(postText) {
+async function composeFaithfulPrompt(postText, sink) {
   const factsRaw = await geminiText(
-    `You are a food scientist and photo director. Read the post and list what a camera would actually see when the post's lesson is shown in a photo.
+    `You are a food scientist and a commercial food photographer. Read the post and decide what a camera must capture so a chef understands the lesson from the picture alone.
 Reply ONLY as JSON:
 {"lesson":"one sentence",
- "layout":"how to show it, e.g. same subject side by side, left = mistake, right = correct",
- "setting":"real kitchen surface, tools, equipment named in the post",
- "states":[{"subject":"exact food/equipment","state":"e.g. air-exposed for 2 hours",
-   "must_look":"precise visible appearance in real life INCLUDING DEGREE: color and how dark or light, wet or dry, matte or shiny, texture, size, condensation, frost, steam, etc. Be strong and unambiguous (e.g. deep brown to almost black patches, not slightly tan)",
-   "must_not_look":"what it must NOT look like (e.g. green, fresh, glossy, only lightly tinted)"}]}
-Use true real-world physics and chemistry from the post. If the post gives numbers (temperatures, times, depths), reflect them visually where a camera could show them. English only.`,
+ "layout":"how the finished graphic is assembled, e.g. two separate photos joined side by side, left = mistake, right = correct",
+ "setting":"real kitchen surface and equipment named in the post",
+ "states":[{
+   "label":"short English label of this state, e.g. MISTAKE: air-exposed",
+   "subject":"exact food/equipment",
+   "identity_features":"the features that make this subject instantly recognisable and unmistakable versus look-alikes (e.g. meringue: stiff white foam standing in upright sharp curled peaks, matte-satin, piped swirls or baked crisp shell with pale gold tips)",
+   "confusable_with":"look-alike foods an image model may wrongly draw (e.g. custard, whipped cream, pudding)",
+   "visual_anchors":"POSITIVE-ONLY description of how this state looks in real life, including strong degree, with familiar colour references and texture (e.g. avocado air-exposed for 4 hours: flesh the colour of strong tea to dark milk chocolate, dry matte surface, slightly sunken and wrinkled, dark brown almost black at the edges)",
+   "how_to_recreate":"how a cook would produce this exact state for a real photo"}]}
+Use true physics and chemistry from the post. English only.`,
     postText
   );
   const facts = parseJson(factsRaw);
-  const draft = await geminiText(
-    `Write ONE image-generation prompt (a single dense paragraph, English) from these visual facts. Rules:
-- Describe the scene and layout concretely, then state every state as a hard requirement using words like "clearly", "unmistakably", "obviously": what it MUST look like, and explicitly what it must NOT look like.
-- The contrast between states must be large and immediately readable in a small phone thumbnail.
-- Keep it physically accurate and natural-looking (real photograph), never cartoonish or exaggerated beyond real life.
-- Same lighting, same board, same camera angle for all states so only the lesson differs.
-- No text, letters, numbers or logos in the image.
-Output ONLY the prompt.`,
-    JSON.stringify(facts)
+  if (sink) sink.facts = facts;
+  const compose = async (sys, user) => parseJson(await geminiText(sys, user));
+  const panelRules = `Write ONE standalone image-generation prompt PER state, as JSON {"panels":[{"label":"...","prompt":"..."}]}. Rules, all mandatory:
+- One subject in one state per prompt. Never put two states or a comparison inside one prompt (image models blend them).
+- Start with the subject's identity_features so it is recognised as the right food, then the visual_anchors with their colour references and degree. Say the degree strongly (deep, dark, obvious).
+- POSITIVE wording only. Never write "not", "no", "without" or mention what the food must not look like, because naming the unwanted thing makes the model draw it. Never mention the look-alike foods.
+- Tight close-up framing so the food fills most of the frame and the key surface detail is large.
+- Use the identical lighting, surface, lens and angle wording in every panel so the pair matches when placed side by side.
+- Realistic natural photograph of the real food. No text, letters, numbers or logos.
+- English only.`;
+  let panels = await compose(panelRules, JSON.stringify(facts));
+  panels = await compose(
+    `Audit these panel prompts against the facts. For each panel verify: (1) exactly one subject and one state, (2) identity_features present so the food cannot be mistaken for its look-alikes, (3) visual_anchors present with strong degree and colour references, (4) no negations and no mention of look-alikes, (5) framing, lighting and surface wording identical across panels. Fix any gap and return the same JSON shape {"panels":[{"label":"...","prompt":"..."}]}. Output ONLY JSON.`,
+    `FACTS:\n${JSON.stringify(facts)}\n\nPANELS:\n${JSON.stringify(panels)}`
   );
-  const audited = await geminiText(
-    `You audit an image prompt against required visual facts. For EACH state in the facts, check the prompt literally contains its must_look details (with the strength of degree, e.g. the darkness) and its must_not_look exclusion. Rewrite the prompt so every state is covered strongly and unambiguously, and the layout matches. Keep it one paragraph, English, no text in the image. Output ONLY the final prompt.`,
-    `FACTS:\n${JSON.stringify(facts)}\n\nPROMPT:\n${draft}`
-  );
-  return (audited || draft || '').trim();
+  const list = (panels.panels || []).filter(x => x && x.prompt);
+  if (!list.length) throw new Error('no panels');
+  if (sink) sink.panels = list;
+  return list.map(x => `${x.label}: ${x.prompt}`).join('\n\n');
 }
 
-async function createVisualPrompt(postText) {
+async function createVisualPrompt(postText, sink) {
   const systemInstruction = `
     You are an expert technical visual graphic designer for professional culinary, food science, and hospitality management content.
     Analyze the provided post text and construct an explicit visual prompt for an image generator.
@@ -257,7 +265,7 @@ async function createVisualPrompt(postText) {
 
   if (process.env.GEMINI_API_KEY) {
     try {
-      const faithful = await composeFaithfulPrompt(postText);
+      const faithful = await composeFaithfulPrompt(postText, sink);
       if (faithful) return faithful;
     } catch (e) {
       console.error('faithful prompt failed, using simple prompt:', e.message);
@@ -591,7 +599,11 @@ app.post('/api/drafts/:id/visual-prompt', requireDashboardAuth, async (req, res)
   const draft = drafts.find(d => d.id === req.params.id);
   if (!draft) return res.status(404).json({ error: 'not found' });
   try {
-    draft.visualPrompt = (await createVisualPrompt(draft.text)).trim() + ' Photographic style: ' + NATURAL_PHOTO_STYLE;
+    const sink = {};
+    const vp = (await createVisualPrompt(draft.text, sink)).trim();
+    draft.facts = sink.facts || null;
+    draft.panels = sink.panels || null;
+    draft.visualPrompt = vp + '\n\nApply to every image: ' + NATURAL_PHOTO_STYLE;
     draft.texturePrompt = await createTexturePrompt(draft.text);
     saveDrafts(drafts);
     res.json({ ok: true, visualPrompt: draft.visualPrompt });
@@ -611,6 +623,31 @@ app.post('/api/drafts/:id/upload-image', requireDashboardAuth, express.json({ li
   draft.imageUrl = '/images/' + name;
   saveDrafts(drafts);
   res.json({ ok: true, imageUrl: draft.imageUrl });
+});
+
+app.post('/api/drafts/:id/check-image', requireDashboardAuth, async (req, res) => {
+  const drafts = getDrafts();
+  const draft = drafts.find(d => d.id === req.params.id);
+  if (!draft || !draft.imageUrl) return res.status(400).json({ error: 'Attach an image first.' });
+  if (!process.env.GEMINI_API_KEY) return res.status(400).json({ error: 'GEMINI_API_KEY is needed for the image check.' });
+  try {
+    const buf = await loadImageBuffer(draft.imageUrl.split('/').pop());
+    if (!buf) throw new Error('Image file not found.');
+    const facts = draft.facts || { lesson: draft.text.slice(0, 300) };
+    const model = process.env.GEMINI_TEXT_MODEL || 'gemini-3.6-flash';
+    const data = await geminiGenerate(model, {
+      systemInstruction: { parts: [{ text: 'You are a strict food-photography QA reviewer for a professional culinary brand. Judge whether the image teaches the post correctly. Reply ONLY as JSON: {"verdict":"PASS or FAIL","issues":["specific problem..."],"stronger_prompt":"a corrected image prompt: one subject per state, positive wording only, strong colour anchors, or empty string if PASS"}. Check: (1) is each required subject clearly the right food, not a look-alike; (2) does each state show the required appearance with sufficient strength (for example, oxidised flesh must be clearly dark brown, not fresh-looking); (3) does it look like a real natural photograph, not AI-generated (plastic sheen, smooth textures, warped shapes, invented text); (4) any text in the image must be correct English.' }] },
+      contents: [{ role: 'user', parts: [
+        { text: 'POST:\n' + draft.text.slice(0, 2500) + '\n\nREQUIRED FACTS:\n' + JSON.stringify(facts) },
+        { inlineData: { mimeType: 'image/png', data: buf.toString('base64') } }
+      ] }]
+    });
+    const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+    const result = parseJson(parts.map(x => x.text || '').join(''));
+    res.json(result);
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
 });
 
 app.post('/api/drafts/:id/generate-image', requireDashboardAuth, async (req, res) => {
@@ -762,6 +799,9 @@ app.get('/', requireDashboardAuth, (req, res) => {
         <button onclick="copyPrompt('${d.id}', this)">Copy prompt</button>
         <button onclick="copyTexture('${d.id}', this)">Copy texture-fix prompt</button>
         <button onclick="pickImage('${d.id}')">Upload image</button>
+        <button onclick="pickTwo('${d.id}')">Join 2 photos (before/after)</button>
+        <input type="file" id="two-${d.id}" accept="image/*" multiple style="display:none" onchange="joinImages('${d.id}', this)">
+        ${d.imageUrl ? `<button onclick="checkImage('${d.id}', this)">Check image</button>` : ''}
         <input type="file" id="file-${d.id}" accept="image/*" style="display:none" onchange="uploadImage('${d.id}', this)">
         <button onclick="generateImage('${d.id}', this)">Quick AI image (basic)</button>
         <button onclick="saveDraft('${d.id}')">Save edits</button>
@@ -850,6 +890,35 @@ app.get('/', requireDashboardAuth, (req, res) => {
           const t = document.querySelector('textarea[data-tp="'+id+'"]').value;
           try { await navigator.clipboard.writeText(t); btn.textContent = 'Copied'; }
           catch(e){ prompt('Copy this prompt:', t); }
+        }
+        function pickTwo(id){ alert('Select exactly 2 photos: the MISTAKE photo first, then the CORRECT photo.'); document.getElementById('two-'+id).click(); }
+        function loadImg(f){ return new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = bad; i.src = URL.createObjectURL(f); }); }
+        async function joinImages(id, input){
+          const files = Array.from(input.files);
+          if(files.length !== 2){ alert('Please select exactly 2 photos.'); return; }
+          const imgs = await Promise.all(files.map(loadImg));
+          const c = document.createElement('canvas'); c.width = 1600; c.height = 800;
+          const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, 1600, 800);
+          imgs.forEach((im, k) => {
+            const side = Math.min(im.width, im.height);
+            x.drawImage(im, (im.width - side) / 2, (im.height - side) / 2, side, side, k * 800 + (k ? 2 : 0), 0, 798, 800);
+          });
+          const res = await fetch('/api/drafts/'+id+'/upload-image', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({data: c.toDataURL('image/png')})});
+          const data = await res.json();
+          if(data.error){ alert('Failed: ' + data.error); return; }
+          location.reload();
+        }
+        async function checkImage(id, btn){
+          btn.disabled = true; btn.textContent = 'Checking...';
+          const res = await fetch('/api/drafts/'+id+'/check-image', {method:'POST'});
+          const data = await res.json();
+          btn.disabled = false; btn.textContent = 'Check image';
+          if(data.error){ alert('Failed: ' + data.error); return; }
+          alert(data.verdict + (data.issues && data.issues.length ? '\\n\\n- ' + data.issues.join('\\n- ') : ''));
+          if(data.verdict === 'FAIL' && data.stronger_prompt){
+            const t = document.querySelector('textarea[data-vp="'+id+'"]');
+            if(t){ t.value = data.stronger_prompt; alert('A corrected prompt was placed in the Visual Prompt box. Click Save edits to keep it.'); }
+          }
         }
         function pickImage(id){ document.getElementById('file-'+id).click(); }
         async function uploadImage(id, input){
