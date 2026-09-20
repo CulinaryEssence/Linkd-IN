@@ -34,6 +34,8 @@ const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
 
 const TOKEN_FILE = path.join(__dirname, 'token-store.json');
 const DRAFTS_FILE = path.join(__dirname, 'drafts.json');
+const IMAGES_DIR = path.join(__dirname, 'images');
+if (!fs.existsSync(IMAGES_DIR)) fs.mkdirSync(IMAGES_DIR, { recursive: true });
 
 // ---------- Local JSON Database Storage ----------
 function readJSON(file, fallback) {
@@ -335,6 +337,56 @@ app.post('/api/admin/import-posts', requireDashboardAuth, (req, res) => {
   }
 });
 
+// ---------- AI Image Generation (from draft text) ----------
+async function requestImage(model, prompt) {
+  const body = { model, prompt: prompt.slice(0, 3900), size: '1024x1024', n: 1 };
+  if (model === 'dall-e-3') body.response_format = 'b64_json';
+  const r = await fetch('https://api.openai.com/v1/images/generations', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok || !data.data || !data.data[0]) {
+    throw new Error((data.error && data.error.message) || 'Image generation failed');
+  }
+  const item = data.data[0];
+  if (item.b64_json) return Buffer.from(item.b64_json, 'base64');
+  if (item.url) return await (await fetch(item.url)).buffer();
+  throw new Error('No image returned');
+}
+
+app.use('/images', requireDashboardAuth, express.static(IMAGES_DIR));
+
+app.post('/api/drafts/:id/generate-image', requireDashboardAuth, async (req, res) => {
+  if (!process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'OPENAI_API_KEY is not set on the server.' });
+  const drafts = getDrafts();
+  const draft = drafts.find(d => d.id === req.params.id);
+  if (!draft) return res.status(404).json({ error: 'not found' });
+
+  try {
+    const prompt = draft.visualPrompt || await createVisualPrompt(draft.text);
+    const primary = process.env.IMAGE_MODEL || 'gpt-image-1';
+    let buf;
+    try {
+      buf = await requestImage(primary, prompt);
+    } catch (e) {
+      if (primary === 'dall-e-3') throw e;
+      console.error(`${primary} failed (${e.message}), falling back to dall-e-3`);
+      buf = await requestImage('dall-e-3', prompt);
+    }
+    const name = `${draft.id}-${Date.now()}.png`;
+    fs.writeFileSync(path.join(IMAGES_DIR, name), buf);
+    draft.visualPrompt = prompt;
+    draft.imageUrl = '/images/' + name;
+    saveDrafts(drafts);
+    res.json({ ok: true, imageUrl: draft.imageUrl });
+  } catch (e) {
+    console.error('generate-image failed:', e);
+    res.status(502).json({ error: e.message });
+  }
+});
+
 // ---------- Image Upload & Post Execution ----------
 async function uploadImageToLinkedIn(imageUrl, accessToken, personUrn) {
   const initRes = await fetch('https://api.linkedin.com/rest/images?action=initializeUpload', {
@@ -351,8 +403,13 @@ async function uploadImageToLinkedIn(imageUrl, accessToken, personUrn) {
   const uploadUrl = initData.value.uploadUrl;
   const imageUrn = initData.value.image;
 
-  const imgRes = await fetch(imageUrl);
-  const imgBuffer = await imgRes.buffer();
+  let imgBuffer;
+  if (imageUrl.startsWith('/images/')) {
+    imgBuffer = fs.readFileSync(path.join(IMAGES_DIR, path.basename(imageUrl)));
+  } else {
+    const imgRes = await fetch(imageUrl);
+    imgBuffer = await imgRes.buffer();
+  }
 
   await fetch(uploadUrl, {
     method: 'PUT',
@@ -422,9 +479,10 @@ app.get('/', requireDashboardAuth, (req, res) => {
     <div class="card ${d.status === 'posted' ? 'posted' : ''}">
       <textarea data-id="${d.id}" ${d.status === 'posted' ? 'readonly' : ''}>${escapeHtml(d.text)}</textarea>
       ${d.visualPrompt ? `<div class="meta" style="margin-top:4px;color:#2b6cb0;"><strong>Visual Prompt:</strong> ${escapeHtml(d.visualPrompt)}</div>` : ''}
-      ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:200px;display:block;margin:8px 0;">` : ''}
+      ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:320px;display:block;margin:8px 0;">` : ''}
       <div class="meta">${d.status === 'posted' ? '✓ Posted ' + d.postedAt : 'Pending review'}</div>
       ${d.status !== 'posted' ? `
+        <button onclick="generateImage('${d.id}', this)">${d.imageUrl ? 'Regenerate image' : 'Generate image'}</button>
         <button onclick="saveDraft('${d.id}')">Save edits</button>
         <button onclick="postDraft('${d.id}')" class="post-btn">Approve &amp; Post</button>
         <button onclick="deleteDraft('${d.id}')" class="delete-btn">Delete</button>
@@ -493,6 +551,13 @@ app.get('/', requireDashboardAuth, (req, res) => {
             body: JSON.stringify({text})
           });
           alert('Saved.');
+        }
+        async function generateImage(id, btn){
+          btn.disabled = true; btn.textContent = 'Generating (30-60s)...';
+          const res = await fetch('/api/drafts/'+id+'/generate-image', {method:'POST', headers:{'Authorization':authHeader()}});
+          const data = await res.json();
+          if(data.error){ alert('Failed: ' + data.error); btn.disabled = false; btn.textContent = 'Generate image'; return; }
+          location.reload();
         }
         async function postDraft(id){
           if(!confirm('Post this to LinkedIn now?')) return;
