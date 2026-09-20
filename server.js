@@ -45,22 +45,118 @@ function readJSON(file, fallback) {
 function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
-function getToken() { return readJSON(TOKEN_FILE, null); }
-function saveToken(token) { writeJSON(TOKEN_FILE, token); }
-function getDrafts() { return readJSON(DRAFTS_FILE, []); }
-function saveDrafts(drafts) { writeJSON(DRAFTS_FILE, drafts); }
+// Storage: in-memory cache, written through to Redis/Valkey (REDIS_URL) when configured so data
+// survives Render redeploys; local JSON files remain as a fallback.
+const REDIS_URL = process.env.REDIS_URL;
+let redis = null;
+const cache = { drafts: null, token: null };
 
-// ---------- Basic Auth ----------
+async function initStorage() {
+  if (REDIS_URL) {
+    try {
+      const { createClient } = require('redis');
+      redis = createClient({ url: REDIS_URL });
+      redis.on('error', e => console.error('redis error:', e.message));
+      await redis.connect();
+      const d = await redis.get('lp:drafts');
+      const t = await redis.get('lp:token');
+      cache.drafts = d ? JSON.parse(d) : null;
+      cache.token = t ? JSON.parse(t) : null;
+      console.log('Storage: Redis connected');
+    } catch (e) {
+      console.error('Redis unavailable, using local files only:', e.message);
+      redis = null;
+    }
+  }
+  if (cache.drafts === null) cache.drafts = readJSON(DRAFTS_FILE, []);
+  if (cache.token === null) cache.token = readJSON(TOKEN_FILE, null);
+  if (redis) {
+    await redis.set('lp:drafts', JSON.stringify(cache.drafts));
+    if (cache.token) await redis.set('lp:token', JSON.stringify(cache.token));
+  }
+}
+function persist(key, file, value) {
+  try { writeJSON(file, value); } catch (e) { /* read-only disk is fine when Redis is used */ }
+  if (redis) redis.set(key, JSON.stringify(value)).catch(e => console.error('redis write failed:', e.message));
+}
+function getToken() { return cache.token; }
+function saveToken(token) { cache.token = token; persist('lp:token', TOKEN_FILE, token); }
+function getDrafts() { return cache.drafts || []; }
+function saveDrafts(drafts) { cache.drafts = drafts; persist('lp:drafts', DRAFTS_FILE, drafts); }
+
+// ---------- Auth: 30-day login cookie (phone-friendly) or HTTP Basic (curl/API) ----------
+app.set('trust proxy', 1);
+const SESSION_DAYS = 30;
+function sign(v) {
+  return crypto.createHmac('sha256', 'lp-session:' + (DASHBOARD_PASSWORD || '')).update(v).digest('hex');
+}
+function safeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+function makeSession() {
+  const exp = String(Date.now() + SESSION_DAYS * 86400000);
+  return exp + '.' + sign(exp);
+}
+function validSession(req) {
+  const m = (req.headers.cookie || '').match(/(?:^|;\s*)lp_session=([^;]+)/);
+  if (!m) return false;
+  const [exp, sig] = m[1].split('.');
+  if (!exp || !sig) return false;
+  const good = sign(exp);
+  if (sig.length !== good.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))) return false;
+  return Number(exp) > Date.now();
+}
 function requireDashboardAuth(req, res, next) {
+  if (!DASHBOARD_PASSWORD) return res.status(500).send('DASHBOARD_PASSWORD is not set on the server.');
+  if (validSession(req)) return next();
   const header = req.headers.authorization || '';
   const [scheme, encoded] = header.split(' ');
   if (scheme === 'Basic' && encoded) {
-    const [, pass] = Buffer.from(encoded, 'base64').toString().split(':');
-    if (pass === DASHBOARD_PASSWORD) return next();
+    const decoded = Buffer.from(encoded, 'base64').toString();
+    const pass = decoded.slice(decoded.indexOf(':') + 1);
+    if (safeEqual(pass, DASHBOARD_PASSWORD)) return next();
   }
-  res.set('WWW-Authenticate', 'Basic realm="LinkedIn Poster"');
-  return res.status(401).send('Authentication required.');
+  if (req.method === 'GET' && (req.headers.accept || '').includes('text/html')) return res.redirect('/login');
+  return res.status(401).json({ error: 'Authentication required.' });
 }
+
+const loginFails = new Map();
+function loginPage(msg) {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="LinkedIn Poster">
+<title>LinkedIn Poster - Login</title>
+<style>body{font-family:sans-serif;max-width:360px;margin:20vh auto;padding:0 16px;}
+input,button{width:100%;padding:12px;font-size:16px;margin-top:10px;box-sizing:border-box;border-radius:6px;}
+button{background:#1a7f37;color:#fff;border:none;} .err{color:#c53030;}</style></head>
+<body><h2>LinkedIn Poster</h2>${msg ? `<p class="err">${msg}</p>` : ''}
+<form method="POST" action="/login">
+<input type="text" name="username" value="u" autocomplete="username" style="display:none">
+<input type="password" name="password" placeholder="Dashboard password" autocomplete="current-password" autofocus required>
+<button type="submit">Log in</button></form></body></html>`;
+}
+// Unauthenticated health check (for uptime pings that keep the free Render instance awake)
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+app.get('/login', (req, res) => res.send(loginPage('')));
+app.post('/login', (req, res) => {
+  const ip = req.ip;
+  const rec = loginFails.get(ip) || { n: 0, t: Date.now() };
+  if (Date.now() - rec.t > 600000) { rec.n = 0; rec.t = Date.now(); }
+  if (rec.n >= 5) return res.status(429).send(loginPage('Too many attempts. Try again in 10 minutes.'));
+  const pass = (req.body && req.body.password) || '';
+  if (DASHBOARD_PASSWORD && safeEqual(pass, DASHBOARD_PASSWORD)) {
+    loginFails.delete(ip);
+    const secure = req.secure || req.headers['x-forwarded-proto'] === 'https';
+    res.setHeader('Set-Cookie', `lp_session=${makeSession()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}${secure ? '; Secure' : ''}`);
+    return res.redirect('/');
+  }
+  rec.n++; loginFails.set(ip, rec);
+  return res.status(401).send(loginPage('Wrong password.'));
+});
 
 // =====================================================================
 // AI Transformation Step 1: Technical Visual Prompt Generator
@@ -338,6 +434,21 @@ app.post('/api/admin/import-posts', requireDashboardAuth, (req, res) => {
 });
 
 // ---------- AI Image Generation (from draft text) ----------
+async function saveImageBuffer(name, buf) {
+  fs.writeFileSync(path.join(IMAGES_DIR, name), buf);
+  if (redis) await redis.set('lp:img:' + name, buf.toString('base64'), { EX: 14 * 86400 }).catch(e => console.error('redis image write failed:', e.message));
+}
+async function loadImageBuffer(imageUrl) {
+  const name = path.basename(imageUrl);
+  const f = path.join(IMAGES_DIR, name);
+  if (fs.existsSync(f)) return fs.readFileSync(f);
+  if (redis) {
+    const b64 = await redis.get('lp:img:' + name);
+    if (b64) { const buf = Buffer.from(b64, 'base64'); fs.writeFileSync(f, buf); return buf; }
+  }
+  return null;
+}
+
 async function requestImage(model, prompt) {
   const body = { model, prompt: prompt.slice(0, 3900), size: '1024x1024', n: 1 };
   if (model === 'dall-e-3') body.response_format = 'b64_json';
@@ -356,7 +467,11 @@ async function requestImage(model, prompt) {
   throw new Error('No image returned');
 }
 
-app.use('/images', requireDashboardAuth, express.static(IMAGES_DIR));
+app.get('/images/:file', requireDashboardAuth, async (req, res) => {
+  const buf = await loadImageBuffer(req.params.file);
+  if (!buf) return res.status(404).end();
+  res.type('png').send(buf);
+});
 
 app.post('/api/drafts/:id/generate-image', requireDashboardAuth, async (req, res) => {
   if (!process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'OPENAI_API_KEY is not set on the server.' });
@@ -376,7 +491,7 @@ app.post('/api/drafts/:id/generate-image', requireDashboardAuth, async (req, res
       buf = await requestImage('dall-e-3', prompt);
     }
     const name = `${draft.id}-${Date.now()}.png`;
-    fs.writeFileSync(path.join(IMAGES_DIR, name), buf);
+    await saveImageBuffer(name, buf);
     draft.visualPrompt = prompt;
     draft.imageUrl = '/images/' + name;
     saveDrafts(drafts);
@@ -405,7 +520,8 @@ async function uploadImageToLinkedIn(imageUrl, accessToken, personUrn) {
 
   let imgBuffer;
   if (imageUrl.startsWith('/images/')) {
-    imgBuffer = fs.readFileSync(path.join(IMAGES_DIR, path.basename(imageUrl)));
+    imgBuffer = await loadImageBuffer(imageUrl);
+    if (!imgBuffer) throw new Error('Generated image is no longer available. Click Regenerate image.');
   } else {
     const imgRes = await fetch(imageUrl);
     imgBuffer = await imgRes.buffer();
@@ -494,6 +610,10 @@ app.get('/', requireDashboardAuth, (req, res) => {
     <!DOCTYPE html>
     <html>
     <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <meta name="apple-mobile-web-app-capable" content="yes">
+      <meta name="apple-mobile-web-app-title" content="LinkedIn Poster">
       <title>LinkedIn Poster</title>
       <style>
         body{font-family:sans-serif;max-width:700px;margin:40px auto;padding:0 16px;}
@@ -527,11 +647,7 @@ app.get('/', requireDashboardAuth, (req, res) => {
       ${draftCards}
 
       <script>
-        function authHeader(){
-          const pass = sessionStorage.getItem('dashPass') || prompt('Dashboard password:');
-          sessionStorage.setItem('dashPass', pass);
-          return 'Basic ' + btoa(':' + pass);
-        }
+        function authHeader(){ return ''; } // login cookie is sent automatically
         async function addDraft(e){
           e.preventDefault();
           const text = document.getElementById('newText').value;
@@ -581,6 +697,8 @@ function escapeHtml(str) {
   return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-app.listen(PORT, () => {
-  console.log(`LinkedIn Poster running on port ${PORT}`);
+initStorage().then(() => {
+  app.listen(PORT, () => {
+    console.log(`LinkedIn Poster running on port ${PORT}`);
+  });
 });
