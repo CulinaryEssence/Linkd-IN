@@ -208,16 +208,16 @@ async function composeFaithfulPrompt(postText, sink) {
     `You are a food scientist and a commercial food photographer. Read the post and decide what a camera must capture so a chef understands the lesson from the picture alone.
 Reply ONLY as JSON:
 {"lesson":"one sentence",
- "layout":"how the finished graphic is assembled, e.g. two separate photos joined side by side, left = mistake, right = correct",
+ "mode":"single OR before_after. Use single by default: one photo of the hero food/process that the post is about. Use before_after ONLY when the post's point is a visibly different end result between two states of the same food (e.g. air-exposed vs protected avocado). Then exactly 2 states: first = mistake/before, second = correct/after.",
  "setting":"real kitchen surface and equipment named in the post",
  "states":[{
-   "label":"short English label of this state, e.g. MISTAKE: air-exposed",
+   "label":"short English label: for single use IMAGE, for before_after use BEFORE (mistake) and AFTER (correct)",
    "subject":"exact food/equipment",
    "identity_features":"the features that make this subject instantly recognisable and unmistakable versus look-alikes (e.g. meringue: stiff white foam standing in upright sharp curled peaks, matte-satin, piped swirls or baked crisp shell with pale gold tips)",
    "confusable_with":"look-alike foods an image model may wrongly draw (e.g. custard, whipped cream, pudding)",
    "visual_anchors":"POSITIVE-ONLY description of how this state looks in real life, including strong degree, with familiar colour references and texture (e.g. avocado air-exposed for 4 hours: flesh the colour of strong tea to dark milk chocolate, dry matte surface, slightly sunken and wrinkled, dark brown almost black at the edges)",
    "how_to_recreate":"how a cook would produce this exact state for a real photo"}]}
-Use true physics and chemistry from the post. English only.`,
+Use true physics and chemistry from the post. Provide exactly 1 state when mode is single and exactly 2 when before_after. English only.`,
     postText
   );
   const facts = parseJson(factsRaw);
@@ -442,7 +442,7 @@ app.patch('/api/drafts/:id', requireDashboardAuth, (req, res) => {
   if (req.body.text !== undefined) draft.text = req.body.text;
   if (req.body.imageUrl !== undefined) draft.imageUrl = req.body.imageUrl;
   if (req.body.visualPrompt !== undefined) draft.visualPrompt = req.body.visualPrompt;
-  if (req.body.texturePrompt !== undefined) draft.texturePrompt = req.body.texturePrompt;
+  if (Array.isArray(req.body.panels)) { draft.panels = req.body.panels.map(x => ({ label: String(x.label || ''), prompt: String(x.prompt || '') })); draft.visualPrompt = draft.panels.map(x => x.prompt).join('\n\n'); }
   saveDrafts(drafts);
   res.json(draft);
 });
@@ -578,22 +578,6 @@ app.get('/images/:file', requireDashboardAuth, async (req, res) => {
   res.type('png').send(buf);
 });
 
-const TEXTURE_FIX_TEMPLATE = 'Image 1 is the picture to edit. Image 2 is a real photograph used only as a texture reference. Keep image 1 exactly the same: composition, camera angle, lighting, background, surfaces and every object stay unchanged. Only re-render the surface of {SUBJECTS} so it matches the real texture in image 2: {TRAITS}. No glossy or plastic sheen, no smooth gradients, no perfect symmetry. Do not add any text.';
-
-async function createTexturePrompt(postText) {
-  const fallback = TEXTURE_FIX_TEMPLATE.replace('{SUBJECTS}', 'the main food items').replace('{TRAITS}', 'natural uneven color, fine moist grain, tiny pores and irregular edges, true-to-life dull tones');
-  if (!process.env.GEMINI_API_KEY) return fallback;
-  try {
-    const out = await geminiText(
-      'You write image-edit instructions. From the post, identify the main food items shown in a photo of it and the real-world surface texture traits of each (e.g. oxidized avocado: uneven brown patches, moist fine grain, dull matte surface). Reply ONLY as JSON: {"subjects":"...","traits":"..."} in English, subjects as a short phrase, traits as a comma-separated list of 5 to 8 concrete natural texture details.',
-      postText
-    );
-    const j = JSON.parse(String(out).replace(/```json|```/g, '').trim());
-    if (j.subjects && j.traits) return TEXTURE_FIX_TEMPLATE.replace('{SUBJECTS}', j.subjects).replace('{TRAITS}', j.traits);
-  } catch (e) { console.error('texture prompt failed:', e.message); }
-  return fallback;
-}
-
 app.post('/api/drafts/:id/visual-prompt', requireDashboardAuth, async (req, res) => {
   const drafts = getDrafts();
   const draft = drafts.find(d => d.id === req.params.id);
@@ -602,11 +586,11 @@ app.post('/api/drafts/:id/visual-prompt', requireDashboardAuth, async (req, res)
     const sink = {};
     const vp = (await createVisualPrompt(draft.text, sink)).trim();
     draft.facts = sink.facts || null;
-    draft.panels = sink.panels || null;
-    draft.visualPrompt = vp + '\n\nApply to every image: ' + NATURAL_PHOTO_STYLE;
-    draft.texturePrompt = await createTexturePrompt(draft.text);
+    const base = (sink.panels && sink.panels.length) ? sink.panels.slice(0, 2) : [{ label: 'IMAGE', prompt: vp }];
+    draft.panels = base.map(x => ({ label: x.label, prompt: String(x.prompt).trim() + ' ' + NATURAL_PHOTO_STYLE }));
+    draft.visualPrompt = draft.panels.map(x => x.prompt).join('\n\n');
     saveDrafts(drafts);
-    res.json({ ok: true, visualPrompt: draft.visualPrompt });
+    res.json({ ok: true, panels: draft.panels });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
@@ -791,19 +775,18 @@ app.get('/', requireDashboardAuth, (req, res) => {
   const draftCards = drafts.map(d => `
     <div class="card ${d.status === 'posted' ? 'posted' : ''}">
       <textarea data-id="${d.id}" ${d.status === 'posted' ? 'readonly' : ''}>${escapeHtml(d.text)}</textarea>
-      ${d.status !== 'posted' ? `<div class="meta" style="margin-top:6px;color:#2b6cb0;"><strong>Visual Prompt (editable):</strong></div><textarea data-vp="${d.id}" style="min-height:90px;" placeholder="Click Get visual prompt, or type your own">${escapeHtml(d.visualPrompt || '')}</textarea><div class="meta" style="margin-top:6px;color:#2b6cb0;"><strong>Step 2 texture-fix prompt (use with a real reference photo):</strong></div><textarea data-tp="${d.id}" style="min-height:90px;">${escapeHtml(d.texturePrompt || '')}</textarea>` : ''}
+      ${d.status !== 'posted' ? (d.panels && d.panels.length ? d.panels.map((pn, k) => `
+        <div class="meta" style="margin-top:8px;color:#2b6cb0;"><strong>${d.panels.length > 1 ? 'Photo ' + 'AB'[k] + ' (' + escapeHtml(pn.label) + ')' : 'Image prompt'}</strong> - paste into the Gemini app</div>
+        <textarea data-panel="${d.id}:${k}" data-label="${escapeHtml(pn.label)}" style="min-height:90px;">${escapeHtml(pn.prompt)}</textarea>
+        <button onclick="copyPanel('${d.id}', ${k}, this)">Copy prompt${d.panels.length > 1 ? ' ' + 'AB'[k] : ''}</button>
+        ${d.panels.length > 1 ? `<button onclick="pickSlot('${d.id}', ${k})">Upload photo ${'AB'[k]}</button><input type="file" id="slot-${d.id}-${k}" accept="image/*" style="display:none" onchange="setSlot('${d.id}', ${k}, this)">` : ''}
+      `).join('') : '') : ''}
       ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:320px;display:block;margin:8px 0;">` : ''}
       <div class="meta">${d.status === 'posted' ? '✓ Posted ' + d.postedAt : 'Pending review'}</div>
       ${d.status !== 'posted' ? `
-        <button onclick="getPrompt('${d.id}', this)">${d.visualPrompt ? 'New visual prompt' : 'Get visual prompt'}</button>
-        <button onclick="copyPrompt('${d.id}', this)">Copy prompt</button>
-        <button onclick="copyTexture('${d.id}', this)">Copy texture-fix prompt</button>
-        <button onclick="pickImage('${d.id}')">Upload image</button>
-        <button onclick="pickTwo('${d.id}')">Join 2 photos (before/after)</button>
-        <input type="file" id="two-${d.id}" accept="image/*" multiple style="display:none" onchange="joinImages('${d.id}', this)">
+        <button onclick="getPrompt('${d.id}', this)">${d.panels && d.panels.length ? 'Redo image prompt' : '1. Make image prompt'}</button>
+        ${!(d.panels && d.panels.length > 1) ? `<button onclick="pickImage('${d.id}')">2. Upload image</button><input type="file" id="file-${d.id}" accept="image/*" style="display:none" onchange="uploadImage('${d.id}', this)">` : ''}
         ${d.imageUrl ? `<button onclick="checkImage('${d.id}', this)">Check image</button>` : ''}
-        <input type="file" id="file-${d.id}" accept="image/*" style="display:none" onchange="uploadImage('${d.id}', this)">
-        <button onclick="generateImage('${d.id}', this)">Quick AI image (basic)</button>
         <button onclick="saveDraft('${d.id}')">Save edits</button>
         <button onclick="postDraft('${d.id}')" class="post-btn">Approve &amp; Post</button>
         <button onclick="deleteDraft('${d.id}')" class="delete-btn">Delete</button>
@@ -866,11 +849,11 @@ app.get('/', requireDashboardAuth, (req, res) => {
         }
         async function saveDraft(id){
           const text = document.querySelector('textarea[data-id="'+id+'"]').value;
-          const vpEl = document.querySelector('textarea[data-vp="'+id+'"]');
+          const panels = Array.from(document.querySelectorAll('textarea[data-panel^="'+id+':"]')).map(t => ({label: t.getAttribute('data-label'), prompt: t.value}));
           await fetch('/api/drafts/'+id, {
             method:'PATCH',
             headers:{'Content-Type':'application/json','Authorization':authHeader()},
-            body: JSON.stringify({text, visualPrompt: vpEl ? vpEl.value : undefined, texturePrompt: (document.querySelector('textarea[data-tp="'+id+'"]')||{}).value})
+            body: JSON.stringify(panels.length ? {text, panels} : {text})
           });
           alert('Saved.');
         }
@@ -881,32 +864,31 @@ app.get('/', requireDashboardAuth, (req, res) => {
           if(data.error){ alert('Failed: ' + data.error); btn.disabled = false; btn.textContent = 'Get visual prompt'; return; }
           location.reload();
         }
-        async function copyPrompt(id, btn){
-          const t = document.querySelector('textarea[data-vp="'+id+'"]').value;
+        async function copyPanel(id, k, btn){
+          const t = document.querySelector('textarea[data-panel="'+id+':'+k+'"]').value;
           try { await navigator.clipboard.writeText(t); btn.textContent = 'Copied'; }
           catch(e){ prompt('Copy this prompt:', t); }
         }
-        async function copyTexture(id, btn){
-          const t = document.querySelector('textarea[data-tp="'+id+'"]').value;
-          try { await navigator.clipboard.writeText(t); btn.textContent = 'Copied'; }
-          catch(e){ prompt('Copy this prompt:', t); }
-        }
-        function pickTwo(id){ alert('Select exactly 2 photos: the MISTAKE photo first, then the CORRECT photo.'); document.getElementById('two-'+id).click(); }
+        const slots = {};
+        function pickSlot(id, k){ document.getElementById('slot-'+id+'-'+k).click(); }
         function loadImg(f){ return new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = bad; i.src = URL.createObjectURL(f); }); }
-        async function joinImages(id, input){
-          const files = Array.from(input.files);
-          if(files.length !== 2){ alert('Please select exactly 2 photos.'); return; }
-          const imgs = await Promise.all(files.map(loadImg));
-          const c = document.createElement('canvas'); c.width = 1600; c.height = 800;
-          const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, 1600, 800);
-          imgs.forEach((im, k) => {
-            const side = Math.min(im.width, im.height);
-            x.drawImage(im, (im.width - side) / 2, (im.height - side) / 2, side, side, k * 800 + (k ? 2 : 0), 0, 798, 800);
-          });
-          const res = await fetch('/api/drafts/'+id+'/upload-image', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({data: c.toDataURL('image/png')})});
-          const data = await res.json();
-          if(data.error){ alert('Failed: ' + data.error); return; }
-          location.reload();
+        async function setSlot(id, k, input){
+          const f = input.files[0]; if(!f) return;
+          slots[id+':'+k] = f;
+          const btn = input.previousElementSibling; if(btn) btn.textContent = 'Photo ' + 'AB'[k] + ' ready';
+          if(slots[id+':0'] && slots[id+':1']){
+            const imgs = await Promise.all([loadImg(slots[id+':0']), loadImg(slots[id+':1'])]);
+            const c = document.createElement('canvas'); c.width = 1600; c.height = 800;
+            const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, 1600, 800);
+            imgs.forEach((im, i) => {
+              const side = Math.min(im.width, im.height);
+              x.drawImage(im, (im.width - side) / 2, (im.height - side) / 2, side, side, i * 800 + (i ? 2 : 0), 0, 798, 800);
+            });
+            const res = await fetch('/api/drafts/'+id+'/upload-image', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({data: c.toDataURL('image/png')})});
+            const data = await res.json();
+            if(data.error){ alert('Failed: ' + data.error); return; }
+            location.reload();
+          }
         }
         async function checkImage(id, btn){
           btn.disabled = true; btn.textContent = 'Checking...';
@@ -916,8 +898,8 @@ app.get('/', requireDashboardAuth, (req, res) => {
           if(data.error){ alert('Failed: ' + data.error); return; }
           alert(data.verdict + (data.issues && data.issues.length ? '\\n\\n- ' + data.issues.join('\\n- ') : ''));
           if(data.verdict === 'FAIL' && data.stronger_prompt){
-            const t = document.querySelector('textarea[data-vp="'+id+'"]');
-            if(t){ t.value = data.stronger_prompt; alert('A corrected prompt was placed in the Visual Prompt box. Click Save edits to keep it.'); }
+            const boxes = document.querySelectorAll('textarea[data-panel^="'+id+':"]');
+            if(boxes.length === 1){ boxes[0].value = data.stronger_prompt; alert('A corrected prompt was placed in the prompt box. Copy it into Gemini and upload the new image.'); }
           }
         }
         function pickImage(id){ document.getElementById('file-'+id).click(); }
