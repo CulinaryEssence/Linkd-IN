@@ -292,6 +292,49 @@ app.post('/api/admin/upgrade-all-posts', requireDashboardAuth, async (req, res) 
   }
 });
 
+// ---------- Bulk Import: 100 Days posts (no AI rewrite) ----------
+// POST /api/admin/import-posts  body (optional): { "startDate": "YYYY-MM-DD" }
+// Loads every post in posts/culinary_essence_100_days.md as a pending draft, text kept exactly as written.
+// Safe to re-run: days already imported are skipped. Nothing posts without "Approve & Post".
+app.post('/api/admin/import-posts', requireDashboardAuth, (req, res) => {
+  try {
+    const src = fs.readFileSync(path.join(__dirname, 'posts', 'culinary_essence_100_days.md'), 'utf8');
+    const blocks = src.split(/^---\s*$/m).map(b => b.trim()).filter(b => /^## Day /.test(b));
+    const start = req.body && req.body.startDate ? new Date(req.body.startDate + 'T09:00:00+04:00') : null;
+    const drafts = getDrafts();
+    const existing = new Set(drafts.map(d => d.day).filter(Boolean));
+    const added = [];
+
+    blocks.forEach((block, i) => {
+      const m = block.match(/^## (Day [\d &]+): (.*)\n+([\s\S]*)$/);
+      if (!m) return;
+      const day = m[1], title = m[2].trim(), text = m[3].trim();
+      if (existing.has(day)) return;
+      const draft = {
+        id: crypto.randomUUID(),
+        day, title, text,
+        visualPrompt: null,
+        imageUrl: null,
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+        order: i + 1
+      };
+      if (start) {
+        // Day 5 & 6 is one post, so schedule by list position, not day number
+        draft.scheduledFor = new Date(start.getTime() + i * 86400000).toISOString();
+      }
+      added.push(draft);
+    });
+
+    added.sort((a, b) => b.order - a.order).forEach(d => drafts.unshift(d));
+    saveDrafts(drafts);
+    res.json({ success: true, imported: added.length, skipped: blocks.length - added.length });
+  } catch (e) {
+    console.error('Import failed:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------- Image Upload & Post Execution ----------
 async function uploadImageToLinkedIn(imageUrl, accessToken, personUrn) {
   const initRes = await fetch('https://api.linkedin.com/rest/images?action=initializeUpload', {
