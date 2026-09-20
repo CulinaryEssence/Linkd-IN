@@ -199,18 +199,18 @@ async function createVisualPrompt(postText) {
     You are an expert technical visual graphic designer for professional culinary, food science, and hospitality management content.
     Analyze the provided post text and construct an explicit visual prompt for an image generator.
 
-    YOUR JOB: turn the post into ONE image that a busy chef or restaurant manager understands in 3 seconds, and that explains the post's main idea visually.
+    YOUR JOB: turn the post into ONE natural, real-looking photograph that a busy chef or restaurant manager understands in 3 seconds and that teaches the post's main idea without any words.
 
     METHOD (do this silently, output only the final prompt):
-    1. Extract the post's single core lesson, plus the 3 to 5 most concrete things it names (specific ingredients, equipment, temperatures, times, measurements, the mistake and the fix).
-    2. Design a visual story that shows those exact things: usually a split-frame "wrong way vs right way" (left = the common mistake, right = the correct method), or a cross-section / step sequence of the process.
-    3. Use realistic, sharp professional food or commercial kitchen imagery of the exact subject (the dough, the stock, the hotel pans in the blast chiller, the probe thermometer in the product), combined with clean diagram elements: arrows, temperature readouts, zone colors, magnified insets.
-    4. Add a short English headline (max 6 words) stating the lesson, plus at most 4 short English labels taken from the post (for example "40F to 140F Danger Zone", "Shallow Pans", "2 inch depth"). All text must be correctly spelled English, large and legible.
-    5. Never make generic stock imagery, chefs holding plates, or unrelated garnish shots. Every element in the image must come from the post.
+    1. Extract the post's single core lesson and the 3 to 5 most concrete things it names (specific ingredients, equipment, temperatures, times, the mistake and the fix).
+    2. Show the lesson as a real before/after or side-by-side comparison of the actual subject (for example: two halves of the same avocado, one browned after air exposure, one protected with lime juice and plastic wrap, on the same board). The difference must be obvious and physically accurate.
+    3. Look like an authentic documentary photograph from a real working kitchen, NOT a glossy render: shot on a full-frame camera, 50mm lens, natural window light mixed with kitchen light, slightly imperfect real surfaces (scratched steel, worn wooden board, a few crumbs, water droplets), true-to-life colors and textures, realistic scale, visible pores and cell texture in the food, gentle film grain. Avoid: plastic-looking or over-smooth surfaces, oversaturated colors, perfect symmetry, glowing edges, floating objects, distorted hands or fruit shapes.
+    4. NO TEXT of any kind in the image: no words, no letters, no numbers, no labels, no logos, no captions, no signs, no packaging print.
+    5. Every object in the frame must come from the post. No generic stock imagery, no chefs holding plates.
 
-    STYLE: premium editorial infographic-photography hybrid, high contrast, clean layout, bright professional kitchen lighting, sharp focus, 1:1 square, scroll-stopping on LinkedIn.
+    FORMAT: 1:1 square, sharp focus, one clear focal subject.
 
-    Write the prompt as one dense paragraph describing exactly what appears in the frame, where, and what the text says.
+    Write the prompt as one dense paragraph describing exactly what appears in the frame, the camera, the light and the surfaces.
 
     Output ONLY the final descriptive image generator prompt text.
   `;
@@ -505,7 +505,7 @@ async function cfImage(prompt) {
   const url = process.env.CF_IMAGE_WORKER_URL;
   const secret = process.env.CF_IMAGE_WORKER_SECRET;
   if (!url || !secret) throw new Error('CF_IMAGE_WORKER_URL/CF_IMAGE_WORKER_SECRET not set');
-  const p = 'Sharp clean flat vector illustration, technical diagram made only of shapes, icons, arrows and color zones. ABSOLUTELY NO text, NO letters, NO words, NO numbers, NO labels, NO captions. No plated food photography. Subject: ' + String(prompt).replace(/\s+/g, ' ').slice(0, 450);
+  const p = 'Authentic documentary photograph in a real working kitchen, natural light, realistic textures, slight film grain, not a render, not glossy. ABSOLUTELY NO text, NO letters, NO words, NO numbers, NO labels. Scene: ' + String(prompt).replace(/\s+/g, ' ').slice(0, 450);
   const r = await fetch(url, {
     method: 'POST',
     headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
@@ -528,7 +528,7 @@ app.post('/api/drafts/:id/visual-prompt', requireDashboardAuth, async (req, res)
   const draft = drafts.find(d => d.id === req.params.id);
   if (!draft) return res.status(404).json({ error: 'not found' });
   try {
-    draft.visualPrompt = (await createVisualPrompt(draft.text)).trim() + ' All text, labels and captions in the image must be in clear, correctly spelled English only.';
+    draft.visualPrompt = (await createVisualPrompt(draft.text)).trim() + ' The image must contain no text, letters, numbers or labels of any kind.';
     saveDrafts(drafts);
     res.json({ ok: true, visualPrompt: draft.visualPrompt });
   } catch (e) {
