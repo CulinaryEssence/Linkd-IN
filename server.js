@@ -451,7 +451,6 @@ async function loadImageBuffer(imageUrl) {
 
 async function requestImage(model, prompt) {
   const body = { model, prompt: prompt.slice(0, 3900), size: '1024x1024', n: 1 };
-  if (model === 'dall-e-3') body.response_format = 'b64_json';
   const r = await fetch('https://api.openai.com/v1/images/generations', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
@@ -481,15 +480,19 @@ app.post('/api/drafts/:id/generate-image', requireDashboardAuth, async (req, res
 
   try {
     const prompt = draft.visualPrompt || await createVisualPrompt(draft.text);
-    const primary = process.env.IMAGE_MODEL || 'gpt-image-1';
-    let buf;
-    try {
-      buf = await requestImage(primary, prompt);
-    } catch (e) {
-      if (primary === 'dall-e-3') throw e;
-      console.error(`${primary} failed (${e.message}), falling back to dall-e-3`);
-      buf = await requestImage('dall-e-3', prompt);
+    const models = [process.env.IMAGE_MODEL || 'gpt-image-1', 'gpt-image-1-mini'].filter((m, i, a) => a.indexOf(m) === i);
+    let buf = null;
+    const errors = [];
+    for (const model of models) {
+      try {
+        buf = await requestImage(model, prompt);
+        break;
+      } catch (e) {
+        console.error(`${model} failed: ${e.message}`);
+        errors.push(`${model}: ${e.message}`);
+      }
     }
+    if (!buf) throw new Error(errors.join(' | '));
     const name = `${draft.id}-${Date.now()}.png`;
     await saveImageBuffer(name, buf);
     draft.visualPrompt = prompt;
