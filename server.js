@@ -194,6 +194,9 @@ async function geminiImage(prompt) {
 // =====================================================================
 // AI Transformation Step 1: Technical Visual Prompt Generator
 // =====================================================================
+// Saved house style: makes generated images look like real, natural photographs.
+const NATURAL_PHOTO_STYLE = 'Candid documentary photograph taken on a real phone or DSLR in an actual working commercial kitchen, not a studio. Natural window light mixed with ordinary overhead kitchen light, slight uneven exposure, soft real shadows. Real-world imperfections: scratched stainless steel, worn wooden or plastic cutting board, water droplets, flour dust, small crumbs, fingerprints, uneven food edges, irregular natural shapes and colors. Accurate food physics and texture, visible grain and pores, muted true-to-life colors, natural depth of field, slightly off-center snapshot composition. Avoid: glossy or plastic surfaces, over-smooth textures, oversaturated or neon color, perfect symmetry, cinematic glow, HDR, studio backdrop, floating or duplicated objects, distorted hands or fruit shapes, illustration, 3D render, CGI, and any text, letters, numbers or logos.';
+
 async function createVisualPrompt(postText) {
   const systemInstruction = `
     You are an expert technical visual graphic designer for professional culinary, food science, and hospitality management content.
@@ -204,7 +207,7 @@ async function createVisualPrompt(postText) {
     METHOD (do this silently, output only the final prompt):
     1. Extract the post's single core lesson and the 3 to 5 most concrete things it names (specific ingredients, equipment, temperatures, times, the mistake and the fix).
     2. Show the lesson as a real before/after or side-by-side comparison of the actual subject (for example: two halves of the same avocado, one browned after air exposure, one protected with lime juice and plastic wrap, on the same board). The difference must be obvious and physically accurate.
-    3. Look like an authentic documentary photograph from a real working kitchen, NOT a glossy render: shot on a full-frame camera, 50mm lens, natural window light mixed with kitchen light, slightly imperfect real surfaces (scratched steel, worn wooden board, a few crumbs, water droplets), true-to-life colors and textures, realistic scale, visible pores and cell texture in the food, gentle film grain. Avoid: plastic-looking or over-smooth surfaces, oversaturated colors, perfect symmetry, glowing edges, floating objects, distorted hands or fruit shapes.
+    3. Look like an authentic documentary photograph from a real working kitchen, NOT a glossy render (a full style paragraph is appended automatically, so focus your prompt on WHAT is in the frame): shot on a full-frame camera, 50mm lens, natural window light mixed with kitchen light, slightly imperfect real surfaces (scratched steel, worn wooden board, a few crumbs, water droplets), true-to-life colors and textures, realistic scale, visible pores and cell texture in the food, gentle film grain. Avoid: plastic-looking or over-smooth surfaces, oversaturated colors, perfect symmetry, glowing edges, floating objects, distorted hands or fruit shapes.
     4. NO TEXT of any kind in the image: no words, no letters, no numbers, no labels, no logos, no captions, no signs, no packaging print.
     5. Every object in the frame must come from the post. No generic stock imagery, no chefs holding plates.
 
@@ -505,7 +508,7 @@ async function cfImage(prompt) {
   const url = process.env.CF_IMAGE_WORKER_URL;
   const secret = process.env.CF_IMAGE_WORKER_SECRET;
   if (!url || !secret) throw new Error('CF_IMAGE_WORKER_URL/CF_IMAGE_WORKER_SECRET not set');
-  const p = 'Authentic documentary photograph in a real working kitchen, natural light, realistic textures, slight film grain, not a render, not glossy. ABSOLUTELY NO text, NO letters, NO words, NO numbers, NO labels. Scene: ' + String(prompt).replace(/\s+/g, ' ').slice(0, 450);
+  const p = String(prompt).replace(/\s+/g, ' ').slice(0, 450) + ' ' + NATURAL_PHOTO_STYLE;
   const r = await fetch(url, {
     method: 'POST',
     headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
@@ -528,7 +531,7 @@ app.post('/api/drafts/:id/visual-prompt', requireDashboardAuth, async (req, res)
   const draft = drafts.find(d => d.id === req.params.id);
   if (!draft) return res.status(404).json({ error: 'not found' });
   try {
-    draft.visualPrompt = (await createVisualPrompt(draft.text)).trim() + ' The image must contain no text, letters, numbers or labels of any kind.';
+    draft.visualPrompt = (await createVisualPrompt(draft.text)).trim() + ' Photographic style: ' + NATURAL_PHOTO_STYLE;
     saveDrafts(drafts);
     res.json({ ok: true, visualPrompt: draft.visualPrompt });
   } catch (e) {
