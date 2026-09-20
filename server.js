@@ -199,17 +199,18 @@ async function createVisualPrompt(postText) {
     You are an expert technical visual graphic designer for professional culinary, food science, and hospitality management content.
     Analyze the provided post text and construct an explicit visual prompt for an image generator.
 
-    CORE MANDATE:
-    - The image must visually resonate with the exact subject of the post. A viewer should understand the topic from the image alone.
-    - Choose the BEST of two styles for this post:
-      A) Professional food or kitchen photography of the specific ingredient, dish, tool or process the post is about (for example the exact dough, sauce, cut of meat, hotel pans in a blast chiller, a thermometer probing a product). Realistic, sharp, natural light, shallow depth of field, real commercial kitchen setting.
-      B) A clean, modern technical infographic or diagram (2-panel comparison, cross-section, workflow, equipment cutaway) when the post is about science, temperatures, systems or processes.
-    - Start your output with the style you chose, e.g. "Professional food photograph:" or "Technical infographic:".
-    - ALL text inside the image must be in English, correctly spelled, and short (max 5 words per label), or there must be no text at all. Never use any other language or script.
-    - Never use generic stock imagery, chefs holding plates, or unrelated garnish shots.
+    YOUR JOB: turn the post into ONE image that a busy chef or restaurant manager understands in 3 seconds, and that explains the post's main idea visually.
 
-    STYLE & FORMATTING:
-    - Format: 1:1 square aspect ratio, high resolution, sharp focus, attractive and scroll-stopping on LinkedIn.
+    METHOD (do this silently, output only the final prompt):
+    1. Extract the post's single core lesson, plus the 3 to 5 most concrete things it names (specific ingredients, equipment, temperatures, times, measurements, the mistake and the fix).
+    2. Design a visual story that shows those exact things: usually a split-frame "wrong way vs right way" (left = the common mistake, right = the correct method), or a cross-section / step sequence of the process.
+    3. Use realistic, sharp professional food or commercial kitchen imagery of the exact subject (the dough, the stock, the hotel pans in the blast chiller, the probe thermometer in the product), combined with clean diagram elements: arrows, temperature readouts, zone colors, magnified insets.
+    4. Add a short English headline (max 6 words) stating the lesson, plus at most 4 short English labels taken from the post (for example "40F to 140F Danger Zone", "Shallow Pans", "2 inch depth"). All text must be correctly spelled English, large and legible.
+    5. Never make generic stock imagery, chefs holding plates, or unrelated garnish shots. Every element in the image must come from the post.
+
+    STYLE: premium editorial infographic-photography hybrid, high contrast, clean layout, bright professional kitchen lighting, sharp focus, 1:1 square, scroll-stopping on LinkedIn.
+
+    Write the prompt as one dense paragraph describing exactly what appears in the frame, where, and what the text says.
 
     Output ONLY the final descriptive image generator prompt text.
   `;
