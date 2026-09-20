@@ -205,7 +205,7 @@ async function createVisualPrompt(postText) {
       A) Professional food or kitchen photography of the specific ingredient, dish, tool or process the post is about (for example the exact dough, sauce, cut of meat, hotel pans in a blast chiller, a thermometer probing a product). Realistic, sharp, natural light, shallow depth of field, real commercial kitchen setting.
       B) A clean, modern technical infographic or diagram (2-panel comparison, cross-section, workflow, equipment cutaway) when the post is about science, temperatures, systems or processes.
     - Start your output with the style you chose, e.g. "Professional food photograph:" or "Technical infographic:".
-    - All text inside the image must be short English words only (max 5 words) or no text at all. Never use any other language.
+    - ALL text inside the image must be in English, correctly spelled, and short (max 5 words per label), or there must be no text at all. Never use any other language or script.
     - Never use generic stock imagery, chefs holding plates, or unrelated garnish shots.
 
     STYLE & FORMATTING:
@@ -527,7 +527,7 @@ app.post('/api/drafts/:id/visual-prompt', requireDashboardAuth, async (req, res)
   const draft = drafts.find(d => d.id === req.params.id);
   if (!draft) return res.status(404).json({ error: 'not found' });
   try {
-    draft.visualPrompt = await createVisualPrompt(draft.text);
+    draft.visualPrompt = (await createVisualPrompt(draft.text)).trim() + ' All text, labels and captions in the image must be in clear, correctly spelled English only.';
     saveDrafts(drafts);
     res.json({ ok: true, visualPrompt: draft.visualPrompt });
   } catch (e) {
