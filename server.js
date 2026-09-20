@@ -200,24 +200,16 @@ async function createVisualPrompt(postText) {
     Analyze the provided post text and construct an explicit visual prompt for an image generator.
 
     CORE MANDATE:
-    - NEVER generate generic plated food photography, aesthetic restaurant dish photos, or stock photos of chefs holding plates.
-    - Focus exclusively on technical graphics: 2-panel comparison diagrams, molecular cross-sections, workflow blueprints, or equipment cutaways.
-    - Match the precise technical, scientific, or procedural topic of the post.
-
-    CATEGORIZATION & VISUAL DIRECTIVES:
-    1. Food Safety & Temperature Control:
-       Render a 2-panel technical comparison diagram, flow chart, or temperature zone graph showing equipment, temperature callouts, and process warnings.
-    2. Culinary Science & Food Chemistry:
-       Render a modern molecular or structural infographic showing visual cross-sections, chemical process stages, and key technical icons.
-    3. Kitchen Management & Operations:
-       Render a clean vector workflow diagram, station layout blueprint, or process control checklist graphic.
-    4. Culinary Techniques & Equipment Mechanics:
-       Render a step-by-step vector instructional diagram showing angles, technique cutaways, thermal gradients, or tool mechanics.
+    - The image must visually resonate with the exact subject of the post. A viewer should understand the topic from the image alone.
+    - Choose the BEST of two styles for this post:
+      A) Professional food or kitchen photography of the specific ingredient, dish, tool or process the post is about (for example the exact dough, sauce, cut of meat, hotel pans in a blast chiller, a thermometer probing a product). Realistic, sharp, natural light, shallow depth of field, real commercial kitchen setting.
+      B) A clean, modern technical infographic or diagram (2-panel comparison, cross-section, workflow, equipment cutaway) when the post is about science, temperatures, systems or processes.
+    - Start your output with the style you chose, e.g. "Professional food photograph:" or "Technical infographic:".
+    - All text inside the image must be short English words only (max 5 words) or no text at all. Never use any other language.
+    - Never use generic stock imagery, chefs holding plates, or unrelated garnish shots.
 
     STYLE & FORMATTING:
-    - Aesthetics: Clean typography hierarchy, modern vector illustration, technical blueprint layout, high contrast.
-    - Format: 1:1 square aspect ratio.
-    - Negative Constraints: NO plain food photography, NO plated meals.
+    - Format: 1:1 square aspect ratio, high resolution, sharp focus, attractive and scroll-stopping on LinkedIn.
 
     Output ONLY the final descriptive image generator prompt text.
   `;
