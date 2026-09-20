@@ -386,6 +386,7 @@ app.patch('/api/drafts/:id', requireDashboardAuth, (req, res) => {
   if (!draft) return res.status(404).json({ error: 'not found' });
   if (req.body.text !== undefined) draft.text = req.body.text;
   if (req.body.imageUrl !== undefined) draft.imageUrl = req.body.imageUrl;
+  if (req.body.visualPrompt !== undefined) draft.visualPrompt = req.body.visualPrompt;
   saveDrafts(drafts);
   res.json(draft);
 });
@@ -688,12 +689,12 @@ app.get('/', requireDashboardAuth, (req, res) => {
   const draftCards = drafts.map(d => `
     <div class="card ${d.status === 'posted' ? 'posted' : ''}">
       <textarea data-id="${d.id}" ${d.status === 'posted' ? 'readonly' : ''}>${escapeHtml(d.text)}</textarea>
-      ${d.visualPrompt ? `<div class="meta" style="margin-top:4px;color:#2b6cb0;"><strong>Visual Prompt:</strong> <span id="vp-${d.id}">${escapeHtml(d.visualPrompt)}</span></div>` : ''}
+      ${d.status !== 'posted' ? `<div class="meta" style="margin-top:6px;color:#2b6cb0;"><strong>Visual Prompt (editable):</strong></div><textarea data-vp="${d.id}" style="min-height:90px;" placeholder="Click Get visual prompt, or type your own">${escapeHtml(d.visualPrompt || '')}</textarea>` : ''}
       ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:320px;display:block;margin:8px 0;">` : ''}
       <div class="meta">${d.status === 'posted' ? '✓ Posted ' + d.postedAt : 'Pending review'}</div>
       ${d.status !== 'posted' ? `
         <button onclick="getPrompt('${d.id}', this)">${d.visualPrompt ? 'New visual prompt' : 'Get visual prompt'}</button>
-        ${d.visualPrompt ? `<button onclick="copyPrompt('${d.id}', this)">Copy prompt</button>` : ''}
+        <button onclick="copyPrompt('${d.id}', this)">Copy prompt</button>
         <button onclick="pickImage('${d.id}')">Upload image</button>
         <input type="file" id="file-${d.id}" accept="image/*" style="display:none" onchange="uploadImage('${d.id}', this)">
         <button onclick="generateImage('${d.id}', this)">Quick AI image (basic)</button>
@@ -759,10 +760,11 @@ app.get('/', requireDashboardAuth, (req, res) => {
         }
         async function saveDraft(id){
           const text = document.querySelector('textarea[data-id="'+id+'"]').value;
+          const vpEl = document.querySelector('textarea[data-vp="'+id+'"]');
           await fetch('/api/drafts/'+id, {
             method:'PATCH',
             headers:{'Content-Type':'application/json','Authorization':authHeader()},
-            body: JSON.stringify({text})
+            body: JSON.stringify({text, visualPrompt: vpEl ? vpEl.value : undefined})
           });
           alert('Saved.');
         }
@@ -774,7 +776,7 @@ app.get('/', requireDashboardAuth, (req, res) => {
           location.reload();
         }
         async function copyPrompt(id, btn){
-          const t = document.getElementById('vp-'+id).innerText;
+          const t = document.querySelector('textarea[data-vp="'+id+'"]').value;
           try { await navigator.clipboard.writeText(t); btn.textContent = 'Copied'; }
           catch(e){ prompt('Copy this prompt:', t); }
         }
