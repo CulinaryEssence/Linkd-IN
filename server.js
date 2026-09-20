@@ -158,6 +158,39 @@ app.post('/login', (req, res) => {
   return res.status(401).send(loginPage('Wrong password.'));
 });
 
+// ---------- Google Gemini helpers (used when GEMINI_API_KEY is set) ----------
+const GEMINI_BASE = process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta/models/';
+async function geminiGenerate(model, body) {
+  const r = await fetch(`${GEMINI_BASE}${model}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error((data.error && data.error.message) || `Gemini HTTP ${r.status}`);
+  return data;
+}
+async function geminiText(system, user) {
+  const model = process.env.GEMINI_TEXT_MODEL || 'gemini-2.5-flash';
+  const data = await geminiGenerate(model, {
+    systemInstruction: { parts: [{ text: system }] },
+    contents: [{ role: 'user', parts: [{ text: user }] }]
+  });
+  const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+  return parts.map(p => p.text || '').join('').trim();
+}
+async function geminiImage(prompt) {
+  const model = process.env.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image';
+  const data = await geminiGenerate(model, {
+    contents: [{ role: 'user', parts: [{ text: prompt.slice(0, 8000) + '\n\nGenerate a 1:1 square image.' }] }],
+    generationConfig: { responseModalities: ['IMAGE', 'TEXT'] }
+  });
+  const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+  const img = parts.find(p => (p.inlineData || p.inline_data));
+  if (!img) throw new Error('Gemini returned no image (' + model + ')');
+  return Buffer.from((img.inlineData || img.inline_data).data, 'base64');
+}
+
 // =====================================================================
 // AI Transformation Step 1: Technical Visual Prompt Generator
 // =====================================================================
@@ -189,6 +222,14 @@ async function createVisualPrompt(postText) {
     Output ONLY the final descriptive image generator prompt text.
   `;
 
+  if (process.env.GEMINI_API_KEY) {
+    try {
+      const out = await geminiText(systemInstruction, `Generate visual prompt for:\n"${postText}"`);
+      if (out) return out;
+    } catch (e) {
+      console.error('Gemini visual prompt failed:', e.message);
+    }
+  }
   try {
     if (!process.env.OPENAI_API_KEY) return postText;
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -473,16 +514,24 @@ app.get('/images/:file', requireDashboardAuth, async (req, res) => {
 });
 
 app.post('/api/drafts/:id/generate-image', requireDashboardAuth, async (req, res) => {
-  if (!process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'OPENAI_API_KEY is not set on the server.' });
+  if (!process.env.GEMINI_API_KEY && !process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'Set GEMINI_API_KEY (or OPENAI_API_KEY) on the server.' });
   const drafts = getDrafts();
   const draft = drafts.find(d => d.id === req.params.id);
   if (!draft) return res.status(404).json({ error: 'not found' });
 
   try {
     const prompt = draft.visualPrompt || await createVisualPrompt(draft.text);
-    const models = [process.env.IMAGE_MODEL || 'gpt-image-1', 'gpt-image-1-mini'].filter((m, i, a) => a.indexOf(m) === i);
     let buf = null;
     const errors = [];
+    if (process.env.GEMINI_API_KEY) {
+      try {
+        buf = await geminiImage(prompt);
+      } catch (e) {
+        console.error('gemini image failed: ' + e.message);
+        errors.push('gemini: ' + e.message);
+      }
+    }
+    const models = (!buf && process.env.OPENAI_API_KEY) ? [process.env.IMAGE_MODEL || 'gpt-image-1', 'gpt-image-1-mini'].filter((m, i, a) => a.indexOf(m) === i) : [];
     for (const model of models) {
       try {
         buf = await requestImage(model, prompt);
