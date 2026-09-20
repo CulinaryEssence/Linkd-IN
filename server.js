@@ -197,6 +197,43 @@ async function geminiImage(prompt) {
 // Saved house style: makes generated images look like real, natural photographs.
 const NATURAL_PHOTO_STYLE = 'Candid documentary photograph taken on a real phone or DSLR in an actual working commercial kitchen, not a studio. Natural window light mixed with ordinary overhead kitchen light, slight uneven exposure, soft real shadows. Real-world imperfections: scratched stainless steel, worn wooden or plastic cutting board, water droplets, flour dust, small crumbs, fingerprints, uneven food edges, irregular natural shapes and colors. Accurate food physics and texture, visible grain and pores, muted true-to-life colors, natural depth of field, slightly off-center snapshot composition. Avoid: glossy or plastic surfaces, over-smooth textures, oversaturated or neon color, perfect symmetry, cinematic glow, HDR, studio backdrop, floating or duplicated objects, distorted hands or fruit shapes, illustration, 3D render, CGI, and any text, letters, numbers or logos.';
 
+// Three-stage prompt builder: (1) pull the physical facts out of the post, (2) write a prompt that
+// states each fact as a hard requirement, (3) audit the prompt against the facts and fix any gap.
+function parseJson(t) {
+  return JSON.parse(String(t).replace(/```json|```/g, '').trim());
+}
+
+async function composeFaithfulPrompt(postText) {
+  const factsRaw = await geminiText(
+    `You are a food scientist and photo director. Read the post and list what a camera would actually see when the post's lesson is shown in a photo.
+Reply ONLY as JSON:
+{"lesson":"one sentence",
+ "layout":"how to show it, e.g. same subject side by side, left = mistake, right = correct",
+ "setting":"real kitchen surface, tools, equipment named in the post",
+ "states":[{"subject":"exact food/equipment","state":"e.g. air-exposed for 2 hours",
+   "must_look":"precise visible appearance in real life INCLUDING DEGREE: color and how dark or light, wet or dry, matte or shiny, texture, size, condensation, frost, steam, etc. Be strong and unambiguous (e.g. deep brown to almost black patches, not slightly tan)",
+   "must_not_look":"what it must NOT look like (e.g. green, fresh, glossy, only lightly tinted)"}]}
+Use true real-world physics and chemistry from the post. If the post gives numbers (temperatures, times, depths), reflect them visually where a camera could show them. English only.`,
+    postText
+  );
+  const facts = parseJson(factsRaw);
+  const draft = await geminiText(
+    `Write ONE image-generation prompt (a single dense paragraph, English) from these visual facts. Rules:
+- Describe the scene and layout concretely, then state every state as a hard requirement using words like "clearly", "unmistakably", "obviously": what it MUST look like, and explicitly what it must NOT look like.
+- The contrast between states must be large and immediately readable in a small phone thumbnail.
+- Keep it physically accurate and natural-looking (real photograph), never cartoonish or exaggerated beyond real life.
+- Same lighting, same board, same camera angle for all states so only the lesson differs.
+- No text, letters, numbers or logos in the image.
+Output ONLY the prompt.`,
+    JSON.stringify(facts)
+  );
+  const audited = await geminiText(
+    `You audit an image prompt against required visual facts. For EACH state in the facts, check the prompt literally contains its must_look details (with the strength of degree, e.g. the darkness) and its must_not_look exclusion. Rewrite the prompt so every state is covered strongly and unambiguously, and the layout matches. Keep it one paragraph, English, no text in the image. Output ONLY the final prompt.`,
+    `FACTS:\n${JSON.stringify(facts)}\n\nPROMPT:\n${draft}`
+  );
+  return (audited || draft || '').trim();
+}
+
 async function createVisualPrompt(postText) {
   const systemInstruction = `
     You are an expert technical visual graphic designer for professional culinary, food science, and hospitality management content.
@@ -219,6 +256,12 @@ async function createVisualPrompt(postText) {
   `;
 
   if (process.env.GEMINI_API_KEY) {
+    try {
+      const faithful = await composeFaithfulPrompt(postText);
+      if (faithful) return faithful;
+    } catch (e) {
+      console.error('faithful prompt failed, using simple prompt:', e.message);
+    }
     try {
       const out = await geminiText(systemInstruction, `Generate visual prompt for:\n"${postText}"`);
       if (out) return out;
@@ -391,6 +434,7 @@ app.patch('/api/drafts/:id', requireDashboardAuth, (req, res) => {
   if (req.body.text !== undefined) draft.text = req.body.text;
   if (req.body.imageUrl !== undefined) draft.imageUrl = req.body.imageUrl;
   if (req.body.visualPrompt !== undefined) draft.visualPrompt = req.body.visualPrompt;
+  if (req.body.texturePrompt !== undefined) draft.texturePrompt = req.body.texturePrompt;
   saveDrafts(drafts);
   res.json(draft);
 });
@@ -526,12 +570,29 @@ app.get('/images/:file', requireDashboardAuth, async (req, res) => {
   res.type('png').send(buf);
 });
 
+const TEXTURE_FIX_TEMPLATE = 'Image 1 is the picture to edit. Image 2 is a real photograph used only as a texture reference. Keep image 1 exactly the same: composition, camera angle, lighting, background, surfaces and every object stay unchanged. Only re-render the surface of {SUBJECTS} so it matches the real texture in image 2: {TRAITS}. No glossy or plastic sheen, no smooth gradients, no perfect symmetry. Do not add any text.';
+
+async function createTexturePrompt(postText) {
+  const fallback = TEXTURE_FIX_TEMPLATE.replace('{SUBJECTS}', 'the main food items').replace('{TRAITS}', 'natural uneven color, fine moist grain, tiny pores and irregular edges, true-to-life dull tones');
+  if (!process.env.GEMINI_API_KEY) return fallback;
+  try {
+    const out = await geminiText(
+      'You write image-edit instructions. From the post, identify the main food items shown in a photo of it and the real-world surface texture traits of each (e.g. oxidized avocado: uneven brown patches, moist fine grain, dull matte surface). Reply ONLY as JSON: {"subjects":"...","traits":"..."} in English, subjects as a short phrase, traits as a comma-separated list of 5 to 8 concrete natural texture details.',
+      postText
+    );
+    const j = JSON.parse(String(out).replace(/```json|```/g, '').trim());
+    if (j.subjects && j.traits) return TEXTURE_FIX_TEMPLATE.replace('{SUBJECTS}', j.subjects).replace('{TRAITS}', j.traits);
+  } catch (e) { console.error('texture prompt failed:', e.message); }
+  return fallback;
+}
+
 app.post('/api/drafts/:id/visual-prompt', requireDashboardAuth, async (req, res) => {
   const drafts = getDrafts();
   const draft = drafts.find(d => d.id === req.params.id);
   if (!draft) return res.status(404).json({ error: 'not found' });
   try {
     draft.visualPrompt = (await createVisualPrompt(draft.text)).trim() + ' Photographic style: ' + NATURAL_PHOTO_STYLE;
+    draft.texturePrompt = await createTexturePrompt(draft.text);
     saveDrafts(drafts);
     res.json({ ok: true, visualPrompt: draft.visualPrompt });
   } catch (e) {
@@ -693,12 +754,13 @@ app.get('/', requireDashboardAuth, (req, res) => {
   const draftCards = drafts.map(d => `
     <div class="card ${d.status === 'posted' ? 'posted' : ''}">
       <textarea data-id="${d.id}" ${d.status === 'posted' ? 'readonly' : ''}>${escapeHtml(d.text)}</textarea>
-      ${d.status !== 'posted' ? `<div class="meta" style="margin-top:6px;color:#2b6cb0;"><strong>Visual Prompt (editable):</strong></div><textarea data-vp="${d.id}" style="min-height:90px;" placeholder="Click Get visual prompt, or type your own">${escapeHtml(d.visualPrompt || '')}</textarea>` : ''}
+      ${d.status !== 'posted' ? `<div class="meta" style="margin-top:6px;color:#2b6cb0;"><strong>Visual Prompt (editable):</strong></div><textarea data-vp="${d.id}" style="min-height:90px;" placeholder="Click Get visual prompt, or type your own">${escapeHtml(d.visualPrompt || '')}</textarea><div class="meta" style="margin-top:6px;color:#2b6cb0;"><strong>Step 2 texture-fix prompt (use with a real reference photo):</strong></div><textarea data-tp="${d.id}" style="min-height:90px;">${escapeHtml(d.texturePrompt || '')}</textarea>` : ''}
       ${d.imageUrl ? `<img src="${d.imageUrl}" style="max-width:320px;display:block;margin:8px 0;">` : ''}
       <div class="meta">${d.status === 'posted' ? '✓ Posted ' + d.postedAt : 'Pending review'}</div>
       ${d.status !== 'posted' ? `
         <button onclick="getPrompt('${d.id}', this)">${d.visualPrompt ? 'New visual prompt' : 'Get visual prompt'}</button>
         <button onclick="copyPrompt('${d.id}', this)">Copy prompt</button>
+        <button onclick="copyTexture('${d.id}', this)">Copy texture-fix prompt</button>
         <button onclick="pickImage('${d.id}')">Upload image</button>
         <input type="file" id="file-${d.id}" accept="image/*" style="display:none" onchange="uploadImage('${d.id}', this)">
         <button onclick="generateImage('${d.id}', this)">Quick AI image (basic)</button>
@@ -768,7 +830,7 @@ app.get('/', requireDashboardAuth, (req, res) => {
           await fetch('/api/drafts/'+id, {
             method:'PATCH',
             headers:{'Content-Type':'application/json','Authorization':authHeader()},
-            body: JSON.stringify({text, visualPrompt: vpEl ? vpEl.value : undefined})
+            body: JSON.stringify({text, visualPrompt: vpEl ? vpEl.value : undefined, texturePrompt: (document.querySelector('textarea[data-tp="'+id+'"]')||{}).value})
           });
           alert('Saved.');
         }
@@ -781,6 +843,11 @@ app.get('/', requireDashboardAuth, (req, res) => {
         }
         async function copyPrompt(id, btn){
           const t = document.querySelector('textarea[data-vp="'+id+'"]').value;
+          try { await navigator.clipboard.writeText(t); btn.textContent = 'Copied'; }
+          catch(e){ prompt('Copy this prompt:', t); }
+        }
+        async function copyTexture(id, btn){
+          const t = document.querySelector('textarea[data-tp="'+id+'"]').value;
           try { await navigator.clipboard.writeText(t); btn.textContent = 'Copied'; }
           catch(e){ prompt('Copy this prompt:', t); }
         }
