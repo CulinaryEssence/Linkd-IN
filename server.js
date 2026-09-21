@@ -151,7 +151,7 @@ app.post('/login', (req, res) => {
   if (DASHBOARD_PASSWORD && safeEqual(pass, DASHBOARD_PASSWORD)) {
     loginFails.delete(ip);
     const secure = req.secure || req.headers['x-forwarded-proto'] === 'https';
-    res.setHeader('Set-Cookie', `lp_session=${makeSession()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}${secure ? '; Secure' : ''}`);
+    res.setHeader('Set-Cookie', `lp_session=${makeSession()}; Path=/; HttpOnly; SameSite=${secure ? 'None' : 'Lax'}; Max-Age=${SESSION_DAYS * 86400}${secure ? '; Secure' : ''}`);
     return res.redirect('/');
   }
   rec.n++; loginFails.set(ip, rec);
