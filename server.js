@@ -487,7 +487,7 @@ app.post('/api/admin/upgrade-all-posts', requireDashboardAuth, async (req, res) 
 app.post('/api/admin/import-posts', requireDashboardAuth, (req, res) => {
   try {
     const src = fs.readFileSync(path.join(__dirname, 'posts', 'culinary_essence_100_days.md'), 'utf8');
-    const blocks = src.split(/^---\s*$/m).map(b => b.trim()).filter(b => /^## Day /.test(b));
+    const blocks = src.split(/^(?=## Day )/m).map(b => b.trim().replace(/\n---\s*$/, '').trim()).filter(b => /^## Day /.test(b));
     const start = req.body && req.body.startDate ? new Date(req.body.startDate + 'T09:00:00+04:00') : null;
     const drafts = getDrafts();
     const existing = new Set(drafts.map(d => d.day).filter(Boolean));
