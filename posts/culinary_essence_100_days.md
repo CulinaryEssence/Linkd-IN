@@ -4,15 +4,35 @@
 
 ## Day 1: Maillard Reaction vs. Caramelization
 
-Stop ruining your seared proteins! Wet pans do not brown meat—they steam it.
+**Your steak is not searing. It is steaming.**
 
-Here is why your steaks aren't getting that deep, savory crust. You're confusing the Maillard reaction with caramelization.
+---
 
-Think of caramelization as making caramel from scratch: you are taking pure sugar—like onions or table sugar—and melting it down under high heat into something sweet and brown.
+**The mistake**
+- Wet protein hits a hot pan. The pan spends its energy boiling off surface water first.
+- Result: grey, rubbery meat with no crust.
 
-The Maillard reaction is completely different. It requires both proteins and sugars, like a steak or a piece of chicken. But here is the catch: it needs a dry surface and heat over 140°C. If your steak is wet when it hits the pan, all the pan's heat gets wasted boiling off that surface water first. Instead of a crisp, restaurant-quality crust, you end up with pale, rubbery, steamed meat.
+---
 
-How do you dry your proteins before searing? Do you pat them down with paper towels, or let them air-dry on a wire rack in the fridge overnight? Drop your routine in the comments!
+**Jargon decoded**
+- **Caramelization:** sugar alone, melted and browned. Think of making toffee.
+- **Maillard reaction:** protein plus sugar, browned together above 140 C. Think of toast, not toffee.
+
+---
+
+**Do this on the line**
+- Pat steaks dry with paper towels, then rest them uncovered on a wire rack in the walk-in for 2 to 12 hours.
+- Preheat a heavy pan or flat-top to 200 C before the protein touches it.
+- Do not overcrowd: leave a hand-width between pieces so steam escapes.
+
+---
+
+**The golden rule**
+Dry -> Preheat -> Sear -> Rest -> Serve
+
+---
+
+**Question for chefs and managers:** how do you dry proteins before service: paper towels, or overnight on a rack? Tell us in the comments.
 
 ---
 
