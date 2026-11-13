@@ -786,6 +786,7 @@ app.get('/', requireDashboardAuth, (req, res) => {
       ${d.status !== 'posted' ? `
         <button onclick="getPrompt('${d.id}', this)">${d.panels && d.panels.length ? 'Redo image prompt' : '1. Make image prompt'}</button>
         ${!(d.panels && d.panels.length > 1) ? `<button onclick="pickImage('${d.id}')">2. Upload image</button><input type="file" id="file-${d.id}" accept="image/*" style="display:none" onchange="uploadImage('${d.id}', this)">` : ''}
+        ${(process.env.CF_IMAGE_WORKER_URL || process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY) ? `<button onclick="generateImage('${d.id}', this)">${d.imageUrl ? 'Regenerate image' : 'Generate image'}</button>` : ''}
         ${d.imageUrl ? `<button onclick="checkImage('${d.id}', this)">Check image</button>` : ''}
         <button onclick="saveDraft('${d.id}')">Save edits</button>
         <button onclick="postDraft('${d.id}')" class="post-btn">Approve &amp; Post</button>
@@ -824,6 +825,9 @@ app.get('/', requireDashboardAuth, (req, res) => {
         ${token ? `Connected as <strong>${token.name || 'your LinkedIn account'}</strong>` : `Not connected — <a href="/auth/linkedin">connect LinkedIn</a> first.`}
       </div>
 
+      ${redis ? '' : '<div class="status not-connected">Storage warning: Redis is not connected, drafts live on temporary disk and vanish on redeploy. Set REDIS_URL on Render.</div>'}
+      ${drafts.length === 0 ? '<div class="card"><strong>No drafts.</strong> <button onclick="importPosts(this)">Import 100 Days series</button></div>' : ''}
+
       <form class="new-draft" onsubmit="return addDraft(event)">
         <h3>New draft</h3>
         <textarea id="newText" placeholder="Paste or write the post text here..."></textarea>
@@ -835,6 +839,13 @@ app.get('/', requireDashboardAuth, (req, res) => {
       ${draftCards}
 
       <script>
+        async function importPosts(btn){
+          btn.disabled = true; btn.textContent = 'Importing...';
+          const r = await fetch('/api/admin/import-posts', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+          const j = await r.json();
+          if(j.error){ alert('Failed: ' + j.error); btn.disabled = false; return; }
+          location.reload();
+        }
         function authHeader(){ return ''; } // login cookie is sent automatically
         async function addDraft(e){
           e.preventDefault();
